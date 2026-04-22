@@ -482,7 +482,7 @@ def download(repo, file, url, gdrive, dir, set_default):
     size_gb = final.stat().st_size / 1_073_741_824
     _ok(f"Downloaded to: {model_path}  ({size_gb:.2f} GB)")
 
-    if set_default or click.confirm("\n  Set as default model in .env?", default=True):
+    if set_default or (sys.stdin.isatty() and click.confirm("\n  Set as default model in .env?", default=True)):
         _write_env("MODEL_PATH", model_path)
         _ok("MODEL_PATH updated in .env")
         _info("Run server with:  bikai start")

@@ -250,7 +250,8 @@ if [[ -f "$MODEL_KNOWN" ]]; then
   ok "Model already exists — skipping download"
 else
   info "Downloading model from Google Drive..."
-  "$BIN_DIR/bikai" download -g "$GDRIVE_ID" || {
+  # --set-default: skip interactive prompt; </dev/tty: prevent consuming bash's stdin from the curl pipe
+  "$BIN_DIR/bikai" download -g "$GDRIVE_ID" --set-default </dev/tty || {
     warn "Model download failed. You can retry with:  bikai download -g $GDRIVE_ID"
   }
 fi
