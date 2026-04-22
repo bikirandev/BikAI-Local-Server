@@ -177,8 +177,11 @@ python3 -m venv venv
 ok "Virtual environment created"
 
 info "Installing packages (this takes 5-15 min — compiling llama-cpp-python)..."
+# Install requirements.txt first (with CMAKE_ARGS so llama-cpp-python compiles with OpenBLAS)
 CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS" \
-  "$INSTALL_DIR/venv/bin/pip" install -e . -q
+  "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
+# Install CLI entry point
+"$INSTALL_DIR/venv/bin/pip" install -e "$INSTALL_DIR" -q
 ok "All packages installed"
 
 # ── Step 5: bikai command ────────────────────────────────────
