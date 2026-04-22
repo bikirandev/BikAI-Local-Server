@@ -24,6 +24,26 @@ err()    { echo -e "  ${RED}✗${NC}  $1" >&2; exit 1; }
 header() { echo -e "\n  ${CYAN}──────────────────────────────────────────────────${NC}\n  ${BOLD}$1${NC}\n  ${CYAN}──────────────────────────────────────────────────${NC}"; }
 step()   { echo -e "\n  ${BOLD}[$1]${NC} $2"; }
 
+# ── Sudo handling ────────────────────────────────────────────
+# If already root, SUDO is a no-op so we never prompt.
+# If not root, cache credentials once upfront so apt/dnf never prompts mid-install.
+if [[ $EUID -eq 0 ]]; then
+  SUDO=""
+else
+  SUDO="sudo"
+  if sudo -n true 2>/dev/null; then
+    : # passwordless sudo — no prompt needed
+  else
+    echo -e "  ${YELLOW}This installer needs sudo to install system packages.${NC}"
+    echo -e "  ${YELLOW}Please enter your password once:${NC}"
+    sudo -v || err "sudo access required. Re-run as root or grant sudo privileges."
+    # Keep sudo timestamp alive in background for the duration of the script
+    ( while true; do sudo -n true; sleep 50; done ) &
+    SUDO_KEEPER_PID=$!
+    trap 'kill $SUDO_KEEPER_PID 2>/dev/null' EXIT
+  fi
+fi
+
 # ── Banner ───────────────────────────────────────────────────
 echo ""
 echo -e "  ${CYAN}██████╗ ██╗██╗  ██╗     █████╗ ██╗${NC}"
@@ -53,11 +73,11 @@ info "Detected OS: $OS"
 # ── Helpers ──────────────────────────────────────────────────
 pkg_install() {
   case $OS in
-    debian) sudo apt-get install -y -qq "$@" ;;
-    fedora) sudo dnf install -y -q "$@" ;;
-    rhel)   sudo yum install -y -q "$@" ;;
-    arch)   sudo pacman -Sy --noconfirm "$@" ;;
-    suse)   sudo zypper install -y "$@" ;;
+    debian) $SUDO apt-get install -y -qq "$@" ;;
+    fedora) $SUDO dnf install -y -q "$@" ;;
+    rhel)   $SUDO yum install -y -q "$@" ;;
+    arch)   $SUDO pacman -Sy --noconfirm "$@" ;;
+    suse)   $SUDO zypper install -y "$@" ;;
     macos)
       if ! command -v brew &>/dev/null; then
         info "Installing Homebrew..."
@@ -114,7 +134,7 @@ ensure_build_deps() {
   case $OS in
     debian) pkg_install build-essential cmake libopenblas-dev pkg-config nginx ;;
     fedora) pkg_install gcc gcc-c++ cmake openblas-devel nginx ;;
-    rhel)   sudo yum groupinstall -y "Development Tools" &>/dev/null; pkg_install cmake openblas-devel nginx ;;
+    rhel)   $SUDO yum groupinstall -y "Development Tools" &>/dev/null; pkg_install cmake openblas-devel nginx ;;
     arch)   pkg_install base-devel cmake openblas nginx ;;
     suse)   pkg_install gcc gcc-c++ cmake openblas-devel nginx ;;
     macos)  pkg_install cmake openblas; xcode-select --install 2>/dev/null || true ;;
