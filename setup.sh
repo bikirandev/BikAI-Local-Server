@@ -276,13 +276,44 @@ PYEOF
 
   # Step B: Start the server in daemon mode
   step "B" "Starting Bik AI server (parallel=$PARALLEL, port=$API_PORT)..."
+  # Disable set -e for the start command — we handle failure ourselves
+  set +e
   "$BIN_DIR/bikai" start \
     --model "$MODEL_FILE" \
     --parallel "$PARALLEL" \
     --port "$API_PORT" \
     --daemon
-  sleep 3
-  ok "Server started"
+  START_EXIT=$?
+  set -e
+
+  if [[ $START_EXIT -ne 0 ]]; then
+    warn "bikai start returned an error. Last log lines:"
+    echo ""
+    tail -30 "$INSTALL_DIR/bikai-server.log" 2>/dev/null | sed 's/^/    /' || true
+    echo ""
+    warn "Fix the issue then run:  bikai start --model '$MODEL_FILE' --parallel $PARALLEL --daemon"
+  else
+    # Wait up to 30s for the health endpoint to respond
+    info "Waiting for server to be ready..."
+    READY=false
+    for i in $(seq 1 30); do
+      if curl -sf "http://localhost:$API_PORT/health" &>/dev/null; then
+        READY=true
+        break
+      fi
+      sleep 1
+    done
+
+    if $READY; then
+      ok "Server is up and healthy"
+    else
+      warn "Server did not respond after 30 seconds. Last log lines:"
+      echo ""
+      tail -30 "$INSTALL_DIR/bikai-server.log" 2>/dev/null | sed 's/^/    /' || true
+      echo ""
+      warn "Fix the issue then run:  bikai start --model '$MODEL_FILE' --parallel $PARALLEL --daemon"
+    fi
+  fi
 fi
 
 # Step C: Setup nginx
