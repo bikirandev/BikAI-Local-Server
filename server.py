@@ -137,6 +137,7 @@ limiter = Limiter(key_func=get_remote_address)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_api_key()
+    _state["started_at"] = time.time()
     _state["pool"] = LlamaPool(
         _config["model_path"],
         size=_config["n_parallel"],
@@ -270,15 +271,43 @@ async def health():
 @app.get("/server/info", response_class=HTMLResponse)
 async def server_info(request: Request):
     """Public server info page — shows model, endpoints, and usage."""
-    model_name = Path(_config["model_path"]).name
-    model_stem = Path(_config["model_path"]).stem
+    model_path = Path(_config["model_path"])
+    model_name = model_path.name
+    model_stem = model_path.stem
     host = request.headers.get("host", "localhost")
     scheme = request.headers.get("x-forwarded-proto", "http")
     base_url = f"{scheme}://{host}"
-    parallel = _config["n_parallel"]
-    ctx = _config["n_ctx"]
-    threads = _config["n_threads"]
-    uptime_since = getattr(_state, "started_at", "unknown")
+    parallel  = _config["n_parallel"]
+    ctx       = _config["n_ctx"]
+    threads   = _config["n_threads"]
+    rate_limit = _config["rate_limit"]
+    port      = os.getenv("PORT", "8000")
+
+    # Model file size
+    try:
+        size_bytes = model_path.stat().st_size
+        size_str = f"{size_bytes / 1_073_741_824:.2f} GB"
+    except Exception:
+        size_str = "unknown"
+
+    # Uptime
+    started_at = _state.get("started_at")
+    if started_at:
+        elapsed = int(time.time() - started_at)
+        h, m = divmod(elapsed // 60, 60)
+        s = elapsed % 60
+        uptime_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+    else:
+        uptime_str = "unknown"
+
+    # CPU / RAM info
+    import platform, resource
+    cpu_count = os.cpu_count() or "?"
+    try:
+        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+        mem_str = f"{mem_mb:,} MB"
+    except Exception:
+        mem_str = "unknown"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -289,64 +318,73 @@ async def server_info(request: Request):
   <style>
     *{{box-sizing:border-box;margin:0;padding:0}}
     body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;padding:2rem}}
-    .logo{{color:#38bdf8;font-weight:800;font-size:1.5rem;letter-spacing:.05em;margin-bottom:.25rem}}
+    .logo{{color:#38bdf8;font-weight:800;font-size:1.6rem;letter-spacing:.05em;margin-bottom:.25rem}}
     .sub{{color:#64748b;font-size:.875rem;margin-bottom:2rem}}
-    .card{{background:#1e2330;border:1px solid #2d3748;border-radius:.75rem;padding:1.5rem;margin-bottom:1.25rem}}
-    .card h2{{font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:#64748b;margin-bottom:1rem}}
-    .row{{display:flex;justify-content:space-between;align-items:center;padding:.5rem 0;border-bottom:1px solid #2d3748}}
+    .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1.25rem;margin-bottom:1.25rem}}
+    .card{{background:#1e2330;border:1px solid #2d3748;border-radius:.75rem;padding:1.5rem}}
+    .card h2{{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:#64748b;margin-bottom:1rem}}
+    .row{{display:flex;justify-content:space-between;align-items:center;padding:.45rem 0;border-bottom:1px solid #1a2035}}
     .row:last-child{{border-bottom:none}}
-    .label{{color:#94a3b8;font-size:.875rem}}
-    .value{{font-size:.875rem;font-weight:500;color:#e2e8f0}}
-    .value.green{{color:#4ade80}}
-    .value.blue{{color:#38bdf8}}
-    .value.yellow{{color:#fbbf24}}
-    .endpoint{{background:#0f1117;border:1px solid #2d3748;border-radius:.5rem;padding:.75rem 1rem;margin-bottom:.75rem}}
-    .method{{display:inline-block;padding:.2rem .6rem;border-radius:.25rem;font-size:.7rem;font-weight:700;margin-right:.75rem}}
-    .get{{background:#1e3a5f;color:#60a5fa}}
-    .post{{background:#1e3d2a;color:#4ade80}}
-    .path{{font-family:monospace;font-size:.875rem;color:#e2e8f0}}
-    .desc{{color:#64748b;font-size:.8rem;margin-top:.35rem;padding-left:3.5rem}}
-    .curl-box{{background:#0f1117;border:1px solid #2d3748;border-radius:.5rem;padding:1rem;font-family:monospace;font-size:.8rem;color:#a5f3fc;overflow-x:auto;white-space:pre;margin-top:.75rem}}
-    .badge{{display:inline-flex;align-items:center;gap:.4rem;padding:.3rem .8rem;border-radius:9999px;font-size:.75rem;font-weight:600}}
-    .badge.running{{background:#14532d;color:#4ade80}}
-    a{{color:#38bdf8;text-decoration:none}}
-    a:hover{{text-decoration:underline}}
-    @media(max-width:600px){{body{{padding:1rem}}.row{{flex-direction:column;align-items:flex-start;gap:.25rem}}}}
+    .label{{color:#94a3b8;font-size:.8rem}}
+    .value{{font-size:.85rem;font-weight:500;color:#e2e8f0;text-align:right;word-break:break-all;max-width:60%}}
+    .green{{color:#4ade80}} .blue{{color:#38bdf8}} .yellow{{color:#fbbf24}} .mono{{font-family:monospace}}
+    .badge{{display:inline-flex;align-items:center;gap:.4rem;padding:.3rem .8rem;border-radius:9999px;font-size:.75rem;font-weight:600;background:#14532d;color:#4ade80}}
+    .endpoint{{background:#0f1117;border:1px solid #2d3748;border-radius:.5rem;padding:.75rem 1rem;margin-bottom:.6rem}}
+    .method{{display:inline-block;padding:.2rem .55rem;border-radius:.25rem;font-size:.68rem;font-weight:700;margin-right:.6rem}}
+    .get{{background:#1e3a5f;color:#60a5fa}} .post{{background:#1e3d2a;color:#4ade80}}
+    .path{{font-family:monospace;font-size:.85rem}}
+    .desc{{color:#64748b;font-size:.78rem;margin-top:.3rem;padding-left:3.2rem}}
+    .code{{background:#0f1117;border:1px solid #2d3748;border-radius:.5rem;padding:1rem;font-family:monospace;font-size:.78rem;color:#a5f3fc;overflow-x:auto;white-space:pre;margin-top:.75rem;line-height:1.6}}
+    .cmd{{background:#1a1f2e;border:1px solid #38bdf855;border-radius:.4rem;padding:.5rem 1rem;font-family:monospace;font-size:.82rem;color:#38bdf8;display:inline-block;margin-top:.4rem}}
+    a{{color:#38bdf8;text-decoration:none}} a:hover{{text-decoration:underline}}
+    @media(max-width:600px){{body{{padding:1rem}}.row{{flex-direction:column;align-items:flex-start;gap:.2rem}}.value{{max-width:100%;text-align:left}}}}
   </style>
 </head>
 <body>
   <div class="logo">BIK AI</div>
   <div class="sub">Local LLM Server &mdash; by <a href="https://bikiran.com" target="_blank">bikiran.com</a></div>
 
-  <div class="card">
-    <h2>Server Status</h2>
-    <div class="row">
-      <span class="label">Status</span>
-      <span class="badge running">&#x25CF; Running</span>
+  <div class="grid">
+
+    <div class="card">
+      <h2>Server Status</h2>
+      <div class="row"><span class="label">Status</span><span class="badge">&#x25CF; Running</span></div>
+      <div class="row"><span class="label">Uptime</span><span class="value green">{uptime_str}</span></div>
+      <div class="row"><span class="label">Port</span><span class="value mono">{port}</span></div>
+      <div class="row"><span class="label">Base URL</span><span class="value blue"><a href="{base_url}">{base_url}</a></span></div>
+      <div class="row"><span class="label">Rate limit</span><span class="value">{rate_limit}</span></div>
     </div>
-    <div class="row">
-      <span class="label">Model</span>
-      <span class="value blue">{model_name}</span>
+
+    <div class="card">
+      <h2>Model</h2>
+      <div class="row"><span class="label">File name</span><span class="value blue mono">{model_name}</span></div>
+      <div class="row"><span class="label">Model ID</span><span class="value mono">{model_stem}</span></div>
+      <div class="row"><span class="label">File size</span><span class="value">{size_str}</span></div>
+      <div class="row"><span class="label">Full path</span><span class="value mono" style="font-size:.72rem">{model_path}</span></div>
     </div>
-    <div class="row">
-      <span class="label">Parallel slots</span>
-      <span class="value">{parallel}</span>
+
+    <div class="card">
+      <h2>Inference Config</h2>
+      <div class="row"><span class="label">Parallel slots</span><span class="value yellow">{parallel}</span></div>
+      <div class="row"><span class="label">Context window</span><span class="value">{ctx:,} tokens</span></div>
+      <div class="row"><span class="label">CPU threads</span><span class="value">{threads}</span></div>
+      <div class="row"><span class="label">Total CPU cores</span><span class="value">{cpu_count}</span></div>
+      <div class="row"><span class="label">Memory usage</span><span class="value">{mem_str}</span></div>
     </div>
-    <div class="row">
-      <span class="label">Context window</span>
-      <span class="value">{ctx:,} tokens</span>
+
+    <div class="card">
+      <h2>Authentication</h2>
+      <div class="row"><span class="label">Header</span><span class="value mono yellow">X-API-Key: &lt;key&gt;</span></div>
+      <div class="row"><span class="label">Token required</span><span class="value">All routes except <span class="mono">/health</span> and <span class="mono">/server/info</span></span></div>
+      <div class="row" style="flex-direction:column;align-items:flex-start;gap:.5rem;padding-top:.75rem">
+        <span class="label">View your API key on the server:</span>
+        <span class="cmd">bikai token show</span>
+      </div>
     </div>
-    <div class="row">
-      <span class="label">CPU threads</span>
-      <span class="value">{threads}</span>
-    </div>
-    <div class="row">
-      <span class="label">Base URL</span>
-      <span class="value"><a href="{base_url}">{base_url}</a></span>
-    </div>
+
   </div>
 
-  <div class="card">
+  <div class="card" style="margin-bottom:1.25rem">
     <h2>Endpoints</h2>
     <div class="endpoint">
       <span class="method get">GET</span><span class="path">/health</span>
@@ -354,45 +392,62 @@ async def server_info(request: Request):
     </div>
     <div class="endpoint">
       <span class="method get">GET</span><span class="path">/server/info</span>
-      <div class="desc">This page</div>
+      <div class="desc">This page &mdash; no auth required</div>
     </div>
     <div class="endpoint">
       <span class="method get">GET</span><span class="path">/v1/models</span>
-      <div class="desc">List loaded model &mdash; requires X-API-Key header</div>
+      <div class="desc">List loaded model &mdash; OpenAI-compatible, requires X-API-Key</div>
     </div>
     <div class="endpoint">
       <span class="method post">POST</span><span class="path">/v1/chat/completions</span>
-      <div class="desc">OpenAI-compatible chat &mdash; supports streaming</div>
+      <div class="desc">Chat completions &mdash; OpenAI-compatible, supports streaming (SSE)</div>
     </div>
     <div class="endpoint">
       <span class="method post">POST</span><span class="path">/generate</span>
-      <div class="desc">Simple text generation</div>
+      <div class="desc">Simple text generation &mdash; requires X-API-Key</div>
     </div>
     <div class="endpoint">
       <span class="method get">GET</span><span class="path">/docs</span>
-      <div class="desc">Interactive API documentation (Swagger UI)</div>
+      <div class="desc">Interactive Swagger UI</div>
     </div>
   </div>
 
   <div class="card">
     <h2>Example Request</h2>
-    <div class="curl-box">curl {base_url}/v1/chat/completions \\
+    <div class="code">curl {base_url}/v1/chat/completions \\
   -H "X-API-Key: YOUR_API_KEY" \\
   -H "Content-Type: application/json" \\
-  -d '{{"messages":[{{"role":"user","content":"Hello!"}}],"stream":false}}'</div>
+  -d '{{"model":"{model_stem}","messages":[{{"role":"user","content":"Hello!"}}],"stream":false}}'</div>
   </div>
 
   <div class="card">
-    <h2>Authentication</h2>
-    <div class="row">
-      <span class="label">Header</span>
-      <span class="value yellow" style="font-family:monospace">X-API-Key: &lt;your-key&gt;</span>
+    <h2>Custom Domain Setup</h2>
+    <p style="color:#94a3b8;font-size:.82rem;margin-bottom:1rem">Point a domain or subdomain at this server, then run one command to configure nginx and optionally get a free SSL certificate.</p>
+
+    <div style="margin-bottom:1rem">
+      <div style="color:#64748b;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;margin-bottom:.5rem">Step 1 &mdash; Point DNS</div>
+      <p style="color:#94a3b8;font-size:.82rem">Add an <strong style="color:#e2e8f0">A record</strong> in your DNS provider pointing your domain to this server&apos;s IP:</p>
+      <div class="code" style="margin-top:.5rem">A  api.yourdomain.com  →  {host.split(":")[0]}</div>
     </div>
-    <div class="row">
-      <span class="label">Get your key</span>
-      <span class="value" style="font-family:monospace">bikai token show</span>
+
+    <div style="margin-bottom:1rem">
+      <div style="color:#64748b;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;margin-bottom:.5rem">Step 2 &mdash; Configure nginx (HTTP)</div>
+      <div class="code">bikai nginx --domain api.yourdomain.com</div>
+    </div>
+
+    <div style="margin-bottom:1rem">
+      <div style="color:#64748b;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;margin-bottom:.5rem">Step 2 &mdash; Configure nginx + SSL (HTTPS) &mdash; recommended</div>
+      <p style="color:#94a3b8;font-size:.82rem;margin-bottom:.5rem">Requires DNS to be live first. Gets a free Let&apos;s Encrypt certificate automatically.</p>
+      <div class="code">bikai nginx --domain api.yourdomain.com --ssl</div>
+    </div>
+
+    <div>
+      <div style="color:#64748b;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;margin-bottom:.5rem">After setup</div>
+      <div class="code">bikai url            # show current public URL
+bikai nginx --status # check nginx config &amp; service</div>
     </div>
   </div>
+
 </body>
 </html>"""
     return HTMLResponse(content=html)
