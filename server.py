@@ -11,10 +11,12 @@ pool executor so the event loop never stalls.
 
 Usage:
   python server.py                               # Local only (http://localhost:8000)
-  python server.py --ngrok                       # Public internet URL via ngrok
-  python server.py --ngrok --ngrok-token TOKEN
   python server.py --model path/to/model.gguf   # Custom GGUF file
   python server.py --parallel 8                 # Allow 8 concurrent sequences
+
+Expose publicly via nginx reverse proxy:
+  bikai nginx --domain api.example.com          # HTTP
+  bikai nginx --domain api.example.com --ssl    # HTTPS via Let's Encrypt
 
 Recommended GGUF models (download from HuggingFace):
   bartowski/gemma-2-2b-it-GGUF  *Q4_K_M*  ~1.5 GB  (default)
@@ -35,7 +37,7 @@ import uvicorn
 from dotenv import load_dotenv, set_key
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.security import APIKeyHeader
 from llama_cpp import Llama  # type: ignore[import-untyped]
 from pydantic import BaseModel, Field
@@ -160,8 +162,10 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    allow_credentials=False,
+    expose_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
@@ -177,6 +181,25 @@ async def require_api_key(key: str = Depends(_api_key_header)) -> str:
     if not secrets.compare_digest(key, _config["api_key"]):
         raise HTTPException(status_code=401, detail="Invalid API key.")
     return key
+
+
+# ---------------------------------------------------------------------------
+# Catch-all OPTIONS handler — ensures CORS preflight always succeeds
+# even when ngrok intercepts before FastAPI middleware can respond.
+# ---------------------------------------------------------------------------
+
+
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*, X-API-Key, Content-Type, ngrok-skip-browser-warning",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +265,137 @@ async def _run_in_thread(fn, *fn_args):
 async def health():
     """Public health-check endpoint — no auth required."""
     return {"status": "ok", "model": Path(_config["model_path"]).name}
+
+
+@app.get("/server/info", response_class=HTMLResponse)
+async def server_info(request: Request):
+    """Public server info page — shows model, endpoints, and usage."""
+    model_name = Path(_config["model_path"]).name
+    model_stem = Path(_config["model_path"]).stem
+    host = request.headers.get("host", "localhost")
+    scheme = request.headers.get("x-forwarded-proto", "http")
+    base_url = f"{scheme}://{host}"
+    parallel = _config["n_parallel"]
+    ctx = _config["n_ctx"]
+    threads = _config["n_threads"]
+    uptime_since = getattr(_state, "started_at", "unknown")
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Bik AI — Server Info</title>
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;padding:2rem}}
+    .logo{{color:#38bdf8;font-weight:800;font-size:1.5rem;letter-spacing:.05em;margin-bottom:.25rem}}
+    .sub{{color:#64748b;font-size:.875rem;margin-bottom:2rem}}
+    .card{{background:#1e2330;border:1px solid #2d3748;border-radius:.75rem;padding:1.5rem;margin-bottom:1.25rem}}
+    .card h2{{font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:#64748b;margin-bottom:1rem}}
+    .row{{display:flex;justify-content:space-between;align-items:center;padding:.5rem 0;border-bottom:1px solid #2d3748}}
+    .row:last-child{{border-bottom:none}}
+    .label{{color:#94a3b8;font-size:.875rem}}
+    .value{{font-size:.875rem;font-weight:500;color:#e2e8f0}}
+    .value.green{{color:#4ade80}}
+    .value.blue{{color:#38bdf8}}
+    .value.yellow{{color:#fbbf24}}
+    .endpoint{{background:#0f1117;border:1px solid #2d3748;border-radius:.5rem;padding:.75rem 1rem;margin-bottom:.75rem}}
+    .method{{display:inline-block;padding:.2rem .6rem;border-radius:.25rem;font-size:.7rem;font-weight:700;margin-right:.75rem}}
+    .get{{background:#1e3a5f;color:#60a5fa}}
+    .post{{background:#1e3d2a;color:#4ade80}}
+    .path{{font-family:monospace;font-size:.875rem;color:#e2e8f0}}
+    .desc{{color:#64748b;font-size:.8rem;margin-top:.35rem;padding-left:3.5rem}}
+    .curl-box{{background:#0f1117;border:1px solid #2d3748;border-radius:.5rem;padding:1rem;font-family:monospace;font-size:.8rem;color:#a5f3fc;overflow-x:auto;white-space:pre;margin-top:.75rem}}
+    .badge{{display:inline-flex;align-items:center;gap:.4rem;padding:.3rem .8rem;border-radius:9999px;font-size:.75rem;font-weight:600}}
+    .badge.running{{background:#14532d;color:#4ade80}}
+    a{{color:#38bdf8;text-decoration:none}}
+    a:hover{{text-decoration:underline}}
+    @media(max-width:600px){{body{{padding:1rem}}.row{{flex-direction:column;align-items:flex-start;gap:.25rem}}}}
+  </style>
+</head>
+<body>
+  <div class="logo">BIK AI</div>
+  <div class="sub">Local LLM Server &mdash; by <a href="https://bikiran.com" target="_blank">bikiran.com</a></div>
+
+  <div class="card">
+    <h2>Server Status</h2>
+    <div class="row">
+      <span class="label">Status</span>
+      <span class="badge running">&#x25CF; Running</span>
+    </div>
+    <div class="row">
+      <span class="label">Model</span>
+      <span class="value blue">{model_name}</span>
+    </div>
+    <div class="row">
+      <span class="label">Parallel slots</span>
+      <span class="value">{parallel}</span>
+    </div>
+    <div class="row">
+      <span class="label">Context window</span>
+      <span class="value">{ctx:,} tokens</span>
+    </div>
+    <div class="row">
+      <span class="label">CPU threads</span>
+      <span class="value">{threads}</span>
+    </div>
+    <div class="row">
+      <span class="label">Base URL</span>
+      <span class="value"><a href="{base_url}">{base_url}</a></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Endpoints</h2>
+    <div class="endpoint">
+      <span class="method get">GET</span><span class="path">/health</span>
+      <div class="desc">Health check &mdash; no auth required</div>
+    </div>
+    <div class="endpoint">
+      <span class="method get">GET</span><span class="path">/server/info</span>
+      <div class="desc">This page</div>
+    </div>
+    <div class="endpoint">
+      <span class="method get">GET</span><span class="path">/v1/models</span>
+      <div class="desc">List loaded model &mdash; requires X-API-Key header</div>
+    </div>
+    <div class="endpoint">
+      <span class="method post">POST</span><span class="path">/v1/chat/completions</span>
+      <div class="desc">OpenAI-compatible chat &mdash; supports streaming</div>
+    </div>
+    <div class="endpoint">
+      <span class="method post">POST</span><span class="path">/generate</span>
+      <div class="desc">Simple text generation</div>
+    </div>
+    <div class="endpoint">
+      <span class="method get">GET</span><span class="path">/docs</span>
+      <div class="desc">Interactive API documentation (Swagger UI)</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Example Request</h2>
+    <div class="curl-box">curl {base_url}/v1/chat/completions \\
+  -H "X-API-Key: YOUR_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"messages":[{{"role":"user","content":"Hello!"}}],"stream":false}}'</div>
+  </div>
+
+  <div class="card">
+    <h2>Authentication</h2>
+    <div class="row">
+      <span class="label">Header</span>
+      <span class="value yellow" style="font-family:monospace">X-API-Key: &lt;your-key&gt;</span>
+    </div>
+    <div class="row">
+      <span class="label">Get your key</span>
+      <span class="value" style="font-family:monospace">bikai token show</span>
+    </div>
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 @app.get("/v1/models", dependencies=[Depends(require_api_key)])
@@ -402,40 +556,12 @@ if __name__ == "__main__":
         default=int(os.getenv("N_THREADS", str(os.cpu_count() or 4))),
         help="CPU threads for inference (default: all cores)",
     )
-    parser.add_argument("--ngrok", action="store_true", help="Expose via ngrok tunnel")
-    parser.add_argument(
-        "--ngrok-token",
-        default=os.getenv("NGROK_AUTH_TOKEN", ""),
-        help="Ngrok auth token",
-    )
-    parser.add_argument(
-        "--ngrok-domain",
-        default=os.getenv("NGROK_DOMAIN", ""),
-        help="Static ngrok domain (e.g. yourword-yourword-xxxx.ngrok-free.app)",
-    )
     args = parser.parse_args()
 
     _config["model_path"] = args.model
     _config["n_parallel"] = args.parallel
     _config["n_ctx"] = args.ctx
     _config["n_threads"] = args.threads
-
-    if args.ngrok:
-        try:
-            from pyngrok import ngrok as _ngrok
-
-            if args.ngrok_token:
-                _ngrok.set_auth_token(args.ngrok_token)
-            connect_opts = {"domain": args.ngrok_domain} if args.ngrok_domain else {}
-            tunnel = _ngrok.connect(args.port, "http", **connect_opts)
-            print(f"\n{'='*60}")
-            print(f"  PUBLIC URL : {tunnel.public_url}")
-            print("  Share this URL with anyone on the internet.")
-            print(f"{'='*60}\n")
-        except ImportError:
-            print("[!] pyngrok not installed. Run: pip install pyngrok")
-        except (RuntimeError, OSError, ConnectionError, TimeoutError) as exc:
-            print(f"[!] ngrok failed: {exc}")
 
     print(f"[*] Starting server on http://{args.host}:{args.port}")
     print(f"[*] API docs: http://localhost:{args.port}/docs\n")
