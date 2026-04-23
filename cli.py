@@ -863,6 +863,38 @@ def _ctrl_is_running() -> bool:
         return False
 
 
+def _auto_build_ui() -> None:
+    """Build the React UI if ui/dist/index.html is missing."""
+    base = Path(__file__).parent
+    index = base / "ui" / "dist" / "index.html"
+    if index.exists():
+        return
+
+    ui_src = base / "ui"
+    if not (ui_src / "package.json").exists():
+        _warn("ui/package.json not found — skipping UI build")
+        return
+
+    npm = subprocess.run(["which", "npm"], capture_output=True, text=True).stdout.strip()
+    if not npm:
+        _warn("npm not found — cannot auto-build UI. Install Node.js 18+ and run: cd ui && npm run build")
+        return
+
+    _info("UI not built. Building now (this takes ~15s)…")
+    if not (ui_src / "node_modules").exists():
+        _info("Installing UI dependencies…")
+        r = subprocess.run([npm, "install", "--silent"], cwd=str(ui_src), capture_output=True, text=True)
+        if r.returncode != 0:
+            _warn(f"npm install failed:\n{r.stderr[:300]}")
+            return
+
+    r = subprocess.run([npm, "run", "build"], cwd=str(ui_src), capture_output=True, text=True)
+    if r.returncode == 0:
+        _ok("UI built successfully.")
+    else:
+        _warn(f"UI build failed:\n{r.stderr[:300]}")
+
+
 def _read_ctrl_pid() -> int | None:
     if CTRL_PID_FILE.exists():
         try:
@@ -890,6 +922,9 @@ def controller_start(port, host):
         _warn("Controller is already running.")
         _info(f"UI: {_ctrl_url()}/controller/ui")
         return
+
+    # Auto-build React UI if dist is missing
+    _auto_build_ui()
 
     cmd = [
         sys.executable,

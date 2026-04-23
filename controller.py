@@ -877,11 +877,52 @@ else:
 # ---------------------------------------------------------------------------
 
 
+def _ensure_ui_built() -> None:
+    """Auto-build the React UI if ui/dist is missing or empty."""
+    index = UI_DIST / "index.html"
+    if index.exists():
+        return  # already built
+
+    ui_src = BASE_DIR / "ui"
+    if not (ui_src / "package.json").exists():
+        print("[!] ui/package.json not found — skipping UI build")
+        return
+
+    npm = subprocess.run(["which", "npm"], capture_output=True, text=True).stdout.strip()
+    if not npm:
+        print("[!] npm not found — cannot auto-build UI. Install Node.js 18+ and re-run setup.sh")
+        return
+
+    print("[*] UI not built. Building now (this takes ~15s)…")
+    # Install node_modules if missing
+    if not (ui_src / "node_modules").exists():
+        print("[*] Installing UI dependencies…")
+        r = subprocess.run(
+            [npm, "install", "--silent"],
+            cwd=str(ui_src), capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            print(f"[!] npm install failed:\n{r.stderr[:500]}")
+            return
+
+    r = subprocess.run(
+        [npm, "run", "build"],
+        cwd=str(ui_src), capture_output=True, text=True
+    )
+    if r.returncode == 0:
+        print("[+] UI built successfully.")
+    else:
+        print(f"[!] UI build failed:\n{r.stderr[:500]}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Bik AI Controller Server")
     parser.add_argument("--port", type=int, default=int(os.getenv("CONTROLLER_PORT", "8001")))
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
+
+    # Auto-build UI if dist is missing
+    _ensure_ui_built()
 
     # Auto-create .env with a generated API key if it doesn't exist or key is blank
     if not _read_env("API_KEY"):
