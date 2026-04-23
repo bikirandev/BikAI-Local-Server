@@ -503,14 +503,14 @@ server {{
 
         # CORS
         add_header 'Access-Control-Allow-Origin' '{cors_origin}' always;
-        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-        add_header 'Access-Control-Allow-Headers' 'X-API-Key, Content-Type, Authorization' always;
+        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, DELETE, PUT, PATCH' always;
+        add_header 'Access-Control-Allow-Headers' 'X-API-Key, Content-Type, Authorization, ngrok-skip-browser-warning' always;
         add_header 'Access-Control-Max-Age' '86400' always;
 
         if ($request_method = OPTIONS) {{
             add_header 'Access-Control-Allow-Origin' '{cors_origin}';
-            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS';
-            add_header 'Access-Control-Allow-Headers' 'X-API-Key, Content-Type, Authorization';
+            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, DELETE, PUT, PATCH';
+            add_header 'Access-Control-Allow-Headers' 'X-API-Key, Content-Type, Authorization, ngrok-skip-browser-warning';
             add_header 'Access-Control-Max-Age' '86400';
             return 204;
         }}
