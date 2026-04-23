@@ -1,18 +1,19 @@
 import { useState, useEffect } from 'react'
-import { saveKey, hasKey, fetchStatus } from './api'
+import { saveKey, hasKey, clearKey, fetchStatus } from './api'
 import type { StatusData } from './api'
 import Dashboard from './pages/Dashboard'
 import Models from './pages/Models'
 import Nginx from './pages/Nginx'
 import Logs from './pages/Logs'
 import Settings from './pages/Settings'
+import Stats from './pages/Stats'
 import {
-  LayoutDashboard, HardDrive, Globe, ScrollText, Settings as SettingsIcon, Lock
+  LayoutDashboard, HardDrive, Globe, ScrollText, Settings as SettingsIcon, Lock, BarChart2, LogOut
 } from 'lucide-react'
 
-type Page = 'dashboard' | 'models' | 'nginx' | 'logs' | 'settings'
+type Page = 'dashboard' | 'models' | 'nginx' | 'logs' | 'settings' | 'stats'
 
-const VALID_PAGES: Page[] = ['dashboard', 'models', 'nginx', 'logs', 'settings']
+const VALID_PAGES: Page[] = ['dashboard', 'models', 'nginx', 'logs', 'settings', 'stats']
 
 function pageFromHash(): Page {
   const hash = window.location.hash.replace(/^#\/?/, '')
@@ -22,6 +23,7 @@ function pageFromHash(): Page {
 const PAGES: { id: Page; label: string; Icon: React.ElementType }[] = [
   { id: 'dashboard', label: 'Dashboard',  Icon: LayoutDashboard },
   { id: 'models',    label: 'Models',     Icon: HardDrive },
+  { id: 'stats',     label: 'Stats',      Icon: BarChart2 },
   { id: 'nginx',     label: 'Nginx',      Icon: Globe },
   { id: 'logs',      label: 'Logs',       Icon: ScrollText },
   { id: 'settings',  label: 'Settings',   Icon: SettingsIcon },
@@ -30,6 +32,7 @@ const PAGES: { id: Page; label: string; Icon: React.ElementType }[] = [
 const PAGE_TITLE: Record<Page, string> = {
   dashboard: 'Dashboard',
   models:    'Models',
+  stats:     'Stats',
   nginx:     'Nginx',
   logs:      'Logs',
   settings:  'Settings',
@@ -100,6 +103,12 @@ export default function App() {
   const [unlocked, setUnlocked] = useState(hasKey())
   const [status, setStatus] = useState<StatusData | null>(null)
 
+  function handleLogout() {
+    clearKey()
+    setUnlocked(false)
+    setStatus(null)
+  }
+
   // Keep URL hash in sync
   function navigate(p: Page) {
     setPage(p)
@@ -165,11 +174,21 @@ export default function App() {
               {status.model_name}
             </span>
           )}
+          <button
+            onClick={handleLogout}
+            className="btn btn-ghost"
+            style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}
+            title="Log out"
+          >
+            <LogOut size={14} />
+            Logout
+          </button>
         </header>
 
         <main className="content">
           {page === 'dashboard' && <Dashboard />}
           {page === 'models'    && <Models />}
+          {page === 'stats'     && <Stats />}
           {page === 'nginx'     && <Nginx />}
           {page === 'logs'      && <Logs />}
           {page === 'settings'  && <Settings />}

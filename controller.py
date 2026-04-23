@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import asyncio
 import os
 import re
 import resource
@@ -40,7 +41,7 @@ import uvicorn
 from dotenv import load_dotenv, set_key
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -186,7 +187,7 @@ async def api_status():
     nginx_enabled = Path("/etc/nginx/sites-enabled/bikai").exists()
     nginx_active = False
     try:
-        r = subprocess.run(["systemctl", "is-active", "nginx"], capture_output=True, text=True)
+        r = await asyncio.to_thread(subprocess.run, ["systemctl", "is-active", "nginx"], capture_output=True, text=True)
         nginx_active = r.stdout.strip() == "active"
     except Exception:
         pass
@@ -242,6 +243,108 @@ async def api_models():
             except Exception:
                 pass
     return {"models": result, "active_path": active}
+
+
+@app.delete("/api/controller/models/{model_name}", dependencies=[Depends(require_api_key)])
+async def api_delete_model(model_name: str):
+    """Delete a downloaded model file."""
+    # Security: only allow filenames, no path traversal
+    if "/" in model_name or ".." in model_name:
+        raise HTTPException(status_code=400, detail="Invalid model name")
+    target = MODELS_DIR / model_name
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Model not found")
+    # Don't delete if it's the active model and AI server is running
+    active = _read_env("MODEL_PATH", "")
+    if _ai_is_running() and active and Path(active).resolve() == target.resolve():
+        raise HTTPException(status_code=409, detail="Cannot delete active model while server is running. Stop the server first.")
+    target.unlink()
+    # Clear MODEL_PATH if it pointed to this file
+    if active and Path(active).resolve() == target.resolve():
+        _write_env("MODEL_PATH", "")
+    return {"ok": True, "deleted": model_name}
+
+
+@app.get("/api/controller/metrics")
+async def api_metrics():
+    """Real-time system metrics as Server-Sent Events stream."""
+    async def event_stream():
+        while True:
+            try:
+                # CPU usage via /proc/stat
+                cpu_pct = 0.0
+                try:
+                    stat1 = Path("/proc/stat").read_text().splitlines()[0].split()
+                    vals1 = [int(x) for x in stat1[1:]]
+                    await asyncio.sleep(0.5)
+                    stat2 = Path("/proc/stat").read_text().splitlines()[0].split()
+                    vals2 = [int(x) for x in stat2[1:]]
+                    idle1, total1 = vals1[3], sum(vals1)
+                    idle2, total2 = vals2[3], sum(vals2)
+                    d_total = total2 - total1
+                    d_idle = idle2 - idle1
+                    cpu_pct = round(100.0 * (1 - d_idle / d_total) if d_total else 0, 1)
+                except Exception:
+                    await asyncio.sleep(0.5)
+
+                # RAM from /proc/meminfo
+                ram_total_mb = ram_used_mb = ram_free_mb = 0
+                try:
+                    meminfo = {}
+                    for line in Path("/proc/meminfo").read_text().splitlines():
+                        k, v = line.split(":", 1)
+                        meminfo[k.strip()] = int(v.strip().split()[0])
+                    ram_total_mb = meminfo.get("MemTotal", 0) // 1024
+                    ram_available_mb = meminfo.get("MemAvailable", 0) // 1024
+                    ram_used_mb = ram_total_mb - ram_available_mb
+                    ram_free_mb = ram_available_mb
+                except Exception:
+                    pass
+
+                # AI server process memory
+                ai_mem_mb = 0
+                pid = _read_pid()
+                if pid and _ai_is_running():
+                    try:
+                        status = Path(f"/proc/{pid}/status").read_text()
+                        for line in status.splitlines():
+                            if line.startswith("VmRSS:"):
+                                ai_mem_mb = int(line.split()[1]) // 1024
+                                break
+                    except Exception:
+                        pass
+
+                # Disk usage
+                disk_total_gb = disk_used_gb = disk_free_gb = 0
+                try:
+                    st = os.statvfs(str(BASE_DIR))
+                    disk_total_gb = round(st.f_blocks * st.f_frsize / 1e9, 1)
+                    disk_free_gb  = round(st.f_bavail * st.f_frsize / 1e9, 1)
+                    disk_used_gb  = round(disk_total_gb - disk_free_gb, 1)
+                except Exception:
+                    pass
+
+                import json
+                data = json.dumps({
+                    "cpu_pct": cpu_pct,
+                    "ram_total_mb": ram_total_mb,
+                    "ram_used_mb": ram_used_mb,
+                    "ram_free_mb": ram_free_mb,
+                    "ram_pct": round(100 * ram_used_mb / ram_total_mb, 1) if ram_total_mb else 0,
+                    "ai_mem_mb": ai_mem_mb,
+                    "disk_total_gb": disk_total_gb,
+                    "disk_used_gb": disk_used_gb,
+                    "disk_free_gb": disk_free_gb,
+                    "disk_pct": round(100 * disk_used_gb / disk_total_gb, 1) if disk_total_gb else 0,
+                })
+                yield f"data: {data}\n\n"
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(1)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +591,7 @@ async def api_nginx_get():
 
     nginx_active = False
     try:
-        r = subprocess.run(["systemctl", "is-active", "nginx"], capture_output=True, text=True)
+        r = await asyncio.to_thread(subprocess.run, ["systemctl", "is-active", "nginx"], capture_output=True, text=True)
         nginx_active = r.stdout.strip() == "active"
     except Exception:
         pass
@@ -509,7 +612,7 @@ async def api_nginx_get():
 async def api_nginx_status():
     """Detailed nginx service status."""
     try:
-        r = subprocess.run(
+        r = await asyncio.to_thread(subprocess.run,
             ["sudo", "nginx", "-t"],
             capture_output=True, text=True,
         )
@@ -520,7 +623,7 @@ async def api_nginx_status():
         config_msg = "nginx not found"
 
     try:
-        r2 = subprocess.run(
+        r2 = await asyncio.to_thread(subprocess.run,
             ["systemctl", "status", "nginx", "--no-pager", "-l"],
             capture_output=True, text=True,
         )

@@ -18,5 +18,11 @@ export default defineConfig([
     languageOptions: {
       globals: globals.browser,
     },
+    rules: {
+      // React Compiler Babel plugin is not enabled in this project
+      'react-hooks/react-compiler': 'off',
+      // Data-fetching on mount is a standard pattern; this rule is overly strict
+      'react-hooks/set-state-in-effect': 'off',
+    },
   },
 ])

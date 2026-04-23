@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { fetchToken, rotateToken } from '../api'
 import { saveKey, clearKey, hasKey } from '../api'
 import { Eye, EyeOff, RefreshCw, Copy, Check, LogOut } from 'lucide-react'
@@ -13,12 +13,12 @@ export default function Settings() {
   const [copied, setCopied] = useState(false)
   const [alert, setAlert] = useState<Alert | null>(null)
 
-  function showAlert(type: Alert['type'], msg: string) {
+  const showAlert = useCallback((type: Alert['type'], msg: string) => {
     setAlert({ type, msg })
     setTimeout(() => setAlert(null), 7000)
-  }
+  }, [])
 
-  async function loadKey() {
+  const loadKey = useCallback(async () => {
     try {
       const r = await fetchToken()
       setServerKey(r.key)
@@ -26,9 +26,9 @@ export default function Settings() {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? String(e)
       showAlert('error', `Could not fetch key: ${msg}`)
     }
-  }
+  }, [showAlert])
 
-  useEffect(() => { if (hasKey()) loadKey() }, [])
+  useEffect(() => { if (hasKey()) loadKey() }, [loadKey])
 
   async function handleRotate() {
     if (!confirm('This will invalidate the current API key. All connected clients will need the new key. Continue?')) return

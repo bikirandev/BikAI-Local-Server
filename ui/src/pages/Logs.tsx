@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { fetchLogs } from '../api'
 import { RefreshCw, Download } from 'lucide-react'
 
@@ -9,7 +9,7 @@ export default function Logs() {
   const [loading, setLoading] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
 
-  async function load(scroll = false) {
+  const load = useCallback(async (scroll = false) => {
     setLoading(true)
     try {
       const r = await fetchLogs(numLines)
@@ -20,15 +20,15 @@ export default function Logs() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [numLines])
 
-  useEffect(() => { load(true) }, [numLines])
+  useEffect(() => { load(true) }, [load])
 
   useEffect(() => {
     if (!autoRefresh) return
     const id = setInterval(() => load(false), 3000)
     return () => clearInterval(id)
-  }, [autoRefresh, numLines])
+  }, [autoRefresh, load])
 
   function colorLine(line: string): string {
     const l = line.toLowerCase()

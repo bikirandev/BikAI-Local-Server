@@ -26,11 +26,7 @@ Recommended GGUF models (download from HuggingFace):
 import asyncio
 import json
 import os
-import resource
 import secrets
-import signal
-import subprocess
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -38,7 +34,7 @@ from pathlib import Path
 from typing import AsyncGenerator, List, Optional
 
 import uvicorn
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
@@ -195,7 +191,7 @@ async def require_api_key(key: str = Depends(_api_key_header)) -> str:
 
 
 @app.options("/{path:path}")
-async def options_handler(path: str):
+async def options_handler(_path: str = ""):
     return Response(
         status_code=200,
         headers={

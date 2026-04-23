@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { fetchStatus, fetchModels, startServer, stopServer, restartServer } from '../api'
 import type { StatusData, ModelInfo, StartPayload } from '../api'
 import { Play, Square, RotateCcw, Cpu, Database, Zap, Clock, Activity } from 'lucide-react'
@@ -18,12 +18,12 @@ export default function Dashboard() {
   })
   const [formDirty, setFormDirty] = useState(false)
 
-  function showAlert(type: Alert['type'], msg: string) {
+  const showAlert = useCallback((type: Alert['type'], msg: string) => {
     setAlert({ type, msg })
     setTimeout(() => setAlert(null), 6000)
-  }
+  }, [])
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       const [s, m] = await Promise.all([fetchStatus(), fetchModels()])
       setStatus(s)
@@ -43,13 +43,13 @@ export default function Dashboard() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [formDirty, showAlert])
 
-  useEffect(() => { load() }, [])
+  useEffect(() => { load() }, [load])
   useEffect(() => {
     const id = setInterval(load, 5000)
     return () => clearInterval(id)
-  }, [formDirty])
+  }, [load])
 
   function patch(k: keyof StartPayload, v: string | number) {
     setForm(f => ({ ...f, [k]: v }))

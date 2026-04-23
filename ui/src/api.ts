@@ -184,3 +184,8 @@ export async function fetchDownloadStatus(): Promise<DownloadStatus> {
   const r = await http.get('/api/controller/download/status')
   return r.data
 }
+
+export async function deleteModel(name: string) {
+  const r = await http.delete(`/api/controller/models/${encodeURIComponent(name)}`)
+  return r.data
+}

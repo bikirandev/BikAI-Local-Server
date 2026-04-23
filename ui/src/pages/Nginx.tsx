@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { fetchNginxConfig, applyNginxConfig, fetchNginxStatus } from '../api'
 import type { NginxConfig, NginxPayload } from '../api'
 import { Save, RefreshCw, CheckCircle, XCircle, Globe } from 'lucide-react'
@@ -27,12 +27,12 @@ export default function Nginx() {
   const [nginxStatus, setNginxStatus] = useState<{ config_valid: boolean; config_message: string; service_status: string } | null>(null)
   const [alert, setAlert] = useState<Alert | null>(null)
 
-  function showAlert(type: Alert['type'], msg: string) {
+  const showAlert = useCallback((type: Alert['type'], msg: string) => {
     setAlert({ type, msg })
     setTimeout(() => setAlert(null), 8000)
-  }
+  }, [])
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       const c = await fetchNginxConfig()
       setCfg(c)
@@ -45,9 +45,9 @@ export default function Nginx() {
     } catch {
       // ignore
     }
-  }
+  }, [])
 
-  async function loadStatus() {
+  const loadStatus = useCallback(async () => {
     setStatusBusy(true)
     try {
       const s = await fetchNginxStatus()
@@ -57,9 +57,9 @@ export default function Nginx() {
     } finally {
       setStatusBusy(false)
     }
-  }
+  }, [])
 
-  useEffect(() => { load(); loadStatus() }, [])
+  useEffect(() => { load(); loadStatus() }, [load, loadStatus])
 
   function patch<K extends keyof NginxPayload>(key: K, val: NginxPayload[K]) {
     setForm(f => ({ ...f, [key]: val }))

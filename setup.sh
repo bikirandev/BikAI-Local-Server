@@ -269,56 +269,47 @@ API_PORT="8000"
 CTRL_PORT="8001"
 PARALLEL="4"
 
-# Step A: Download model from Google Drive (skip if already present)
-step "A" "Checking model..."
-MODEL_KNOWN="$INSTALL_DIR/models/gdrive_gemma3-4b.gguf"
-if [[ -f "$MODEL_KNOWN" ]]; then
-  ok "Model already exists — skipping download"
-else
-  info "Downloading model from Google Drive..."
-  # --set-default: skip interactive prompt; </dev/tty: prevent consuming bash's stdin from the curl pipe
-  "$BIN_DIR/bikai" download -g "$GDRIVE_ID" --set-default </dev/tty || {
-    warn "Model download failed. You can retry with:  bikai download -g $GDRIVE_ID"
-  }
-fi
-
-# Detect downloaded model (prefer known name, fall back to first .gguf found)
-if [[ -f "$MODEL_KNOWN" ]]; then
-  MODEL_FILE="$MODEL_KNOWN"
-else
-  MODEL_FILE=$(find "$INSTALL_DIR/models" -name "*.gguf" | sort | head -1)
-fi
-if [[ -z "$MODEL_FILE" ]]; then
-  warn "No model found in $INSTALL_DIR/models — you can download one from the controller UI after setup."
-else
-  ok "Model: $(basename "$MODEL_FILE")"
-
-  step "B" "Saving model config..."
-  "$INSTALL_DIR/venv/bin/python" - <<PYEOF
+# Step A: Generate API key upfront so it's ready for the summary
+step "A" "Generating API key..."
+"$INSTALL_DIR/venv/bin/python" - <<PYEOF
+import secrets, os
+from pathlib import Path
 from dotenv import set_key
-set_key("$INSTALL_DIR/.env", "MODEL_PATH", "$MODEL_FILE")
-set_key("$INSTALL_DIR/.env", "PORT", "$API_PORT")
-set_key("$INSTALL_DIR/.env", "N_PARALLEL", "$PARALLEL")
+env = Path("$INSTALL_DIR/.env")
+env.touch(exist_ok=True)
+# Only generate if not already set
+current = ""
+try:
+    from dotenv import dotenv_values
+    current = dotenv_values(str(env)).get("API_KEY", "")
+except Exception:
+    pass
+if not current:
+    key = secrets.token_urlsafe(32)
+    set_key(str(env), "API_KEY", key)
+    print(f"Generated API key: {key}")
+else:
+    print(f"Existing API key: {current}")
 PYEOF
-  ok "Config saved to .env"
-fi
+ok "API key ready"
 
-# Step B2: Build the React UI
-step "B2" "Building Controller UI..."
+# Step B: Build the React UI
+step "B" "Building Controller UI..."
 if command -v npm &>/dev/null && [[ -d "$INSTALL_DIR/ui" ]]; then
+  info "Installing UI dependencies..."
   pushd "$INSTALL_DIR/ui" > /dev/null
-  info "Running npm install..."
-  npm install --silent 2>&1 | tail -3 || true
-  info "Building React app..."
-  npm run build 2>&1 | tail -5 || warn "UI build failed — controller will serve without UI assets"
+  npm install --silent --no-progress 2>/dev/null || npm install --silent 2>&1 | grep -E 'error|warn' | head -5 || true
+  ok "Dependencies installed."
+  info "Compiling UI (this takes ~10s)..."
+  npm run build --silent 2>/dev/null || npm run build 2>&1 | grep -E 'error|built in|✓' | tail -5 || warn "UI build failed — controller will serve without UI assets"
   popd > /dev/null
-  ok "UI built."
+  ok "UI compiled."
 else
   warn "npm not found — skipping UI build. Install Node.js 18+ and re-run setup.sh."
 fi
 
-# Step B3: Start everything with a single bikai up
-step "B3" "Starting controller + AI server..."
+# Step C: Start everything with a single bikai up
+step "C" "Starting controller + AI server..."
 set +e
 "$BIN_DIR/bikai" up --api-port "$API_PORT" --ctrl-port "$CTRL_PORT" --parallel "$PARALLEL"
 UP_EXIT=$?
@@ -328,14 +319,14 @@ if [[ $UP_EXIT -ne 0 ]]; then
   warn "bikai up failed. Try manually:  bikai up"
 fi
 
-# Step C: Setup nginx (proxies both / → AI port and /controller → controller port)
-step "C" "Configuring nginx reverse proxy..."
+# Step D: Setup nginx (proxies both / → AI port and /controller → controller port)
+step "D" "Configuring nginx reverse proxy..."
 "$BIN_DIR/bikai" nginx --port "$API_PORT" --ctrl-port "$CTRL_PORT" || {
   warn "nginx setup failed. Run manually:  bikai nginx"
 }
 
-# Step D: Create systemd services for auto-start on reboot
-step "D" "Setting up auto-start on reboot (systemd)..."
+# Step E: Create systemd services for auto-start on reboot
+step "E" "Setting up auto-start on reboot (systemd)..."
 if command -v systemctl &>/dev/null && systemctl is-system-running --quiet 2>/dev/null || \
    command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
 
@@ -400,18 +391,26 @@ fi
 # Get public IP for display
 PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || echo "your-server-ip")
 
+# Read generated API key for display
+API_KEY_DISPLAY=$(grep 'API_KEY' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d "'\"" || echo "run: bikai token show")
+
 echo ""
 echo -e "  ${GREEN}${BOLD}══════════════════════════════════════════════════${NC}"
 echo -e "  ${GREEN}${BOLD}  Bik AI is live!${NC}"
 echo -e "  ${GREEN}${BOLD}══════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "  Public IP      : ${CYAN}http://$PUBLIC_IP${NC}"
-echo -e "  Control Panel  : ${CYAN}http://$PUBLIC_IP/controller/ui${NC}"
-echo -e "  API docs       : ${CYAN}http://$PUBLIC_IP/docs${NC}"
-echo -e "  Health         : ${CYAN}http://$PUBLIC_IP/health${NC}"
+echo -e "  Control Panel  : ${CYAN}${BOLD}http://$PUBLIC_IP/controller/ui${NC}"
+echo -e "  AI API          : ${CYAN}http://$PUBLIC_IP${NC}"
 echo ""
-echo -e "  Your API key:"
-"$BIN_DIR/bikai" token show 2>/dev/null || true
+echo -e "  ${YELLOW}${BOLD}Your API key (save this now):${NC}"
+echo -e "  ${GREEN}${BOLD}  $API_KEY_DISPLAY${NC}"
+echo ""
+echo -e "  Enter this key when prompted by the controller UI."
+echo -e "  To get it again:  ${CYAN}bikai token show${NC}"
+echo ""
+echo -e "  ${BOLD}Next:${NC} Open the Control Panel and go to Models → Download"
+echo -e "  Recommended model: ${CYAN}Gemma 3 4B (Q4_K_M, ~2.3 GB)${NC}"
+echo -e "  Google Drive ID:   ${CYAN}${BOLD}1kO_KTjQ-GcaarzLxqXnUyJkEmbM6UC3d${NC}"
 echo ""
 echo -e "  ${CYAN}Full help:  bikai -h${NC}"
 echo ""
