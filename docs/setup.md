@@ -126,6 +126,93 @@ The script is idempotent — safe to re-run:
 
 ---
 
+## Clean Uninstall + Re-run from Scratch
+
+Use this when you want a completely fresh install (broken venv, corrupted state, major version change).
+
+### Step 1 — Stop running processes
+
+```bash
+# Stop and disable systemd services (if set up)
+sudo systemctl stop bikai-controller.service bikai.service 2>/dev/null
+sudo systemctl disable bikai-controller.service bikai.service 2>/dev/null
+sudo rm -f /etc/systemd/system/bikai-controller.service /etc/systemd/system/bikai.service
+sudo systemctl daemon-reload
+
+# Kill any still-running processes
+pkill -f "controller.py" 2>/dev/null
+pkill -f "server.py" 2>/dev/null
+```
+
+### Step 2 — Remove installation (keep models)
+
+```bash
+# Remove code + venv + UI build, but KEEP downloaded models
+rm -rf ~/.bikai/venv
+rm -rf ~/.bikai/ui/dist
+rm -rf ~/.bikai/ui/node_modules
+# Remove code (will be re-cloned)
+rm -rf ~/.bikai
+
+# Remove the CLI launcher
+rm -f ~/.local/bin/bikai
+```
+
+> **To keep your models**: Copy them out first.
+> ```bash
+> cp -r ~/.bikai/models ~/bikai-models-backup
+> # Then after re-install, move them back:
+> mv ~/bikai-models-backup/* ~/.bikai/models/
+> ```
+
+### Step 3 — Re-run the installer
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bikirandev/BikAI-Local-Server/main/setup.sh | bash
+```
+
+Or locally:
+```bash
+bash setup.sh
+```
+
+---
+
+## Partial Reset (Keep API Key + Models)
+
+If you only need to reset the code/venv without losing your API key or models:
+
+```bash
+pkill -f "controller.py" 2>/dev/null
+pkill -f "server.py" 2>/dev/null
+
+# Backup .env and models
+cp ~/.bikai/.env /tmp/bikai.env.bak
+cp -r ~/.bikai/models /tmp/bikai-models-bak  # if models folder exists
+
+# Wipe and re-clone
+rm -rf ~/.bikai
+git clone https://github.com/bikirandev/BikAI-Local-Server.git ~/.bikai
+
+# Restore .env and models
+cp /tmp/bikai.env.bak ~/.bikai/.env
+mv /tmp/bikai-models-bak ~/.bikai/models
+
+# Rebuild venv
+cd ~/.bikai
+python3 -m venv venv
+CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS" venv/bin/pip install -r requirements.txt
+venv/bin/pip install -e .
+
+# Rebuild UI
+cd ui && npm install && npm run build && cd ..
+
+# Start
+venv/bin/python cli.py controller start --port 8001
+```
+
+---
+
 ## Manual Install (Without setup.sh)
 
 ```bash
