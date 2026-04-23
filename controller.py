@@ -841,39 +841,7 @@ async def controller_health():
 
 
 # ---------------------------------------------------------------------------
-# React SPA — serve built UI
-# ---------------------------------------------------------------------------
-
-if UI_DIST.exists():
-    # Mount static assets
-    app.mount("/controller/assets", StaticFiles(directory=str(UI_DIST / "assets")), name="assets")
-
-    @app.get("/controller/ui")
-    @app.get("/controller/ui/{path:path}")
-    async def serve_ui(path: str = ""):
-        index = UI_DIST / "index.html"
-        if index.exists():
-            return FileResponse(str(index))
-        return JSONResponse(
-            {"error": "UI not built. Run: cd ui && npm run build"},
-            status_code=503,
-        )
-else:
-    @app.get("/controller/ui")
-    @app.get("/controller/ui/{path:path}")
-    async def serve_ui_placeholder(path: str = ""):
-        return JSONResponse(
-            {
-                "error": "UI not built yet.",
-                "fix": "Run:  cd ui && npm run build",
-                "controller_api": "/api/controller/status",
-            },
-            status_code=503,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Main
+# React SPA — auto-build then serve
 # ---------------------------------------------------------------------------
 
 
@@ -893,7 +861,7 @@ def _ensure_ui_built() -> None:
         print("[!] npm not found — cannot auto-build UI. Install Node.js 18+ and re-run setup.sh")
         return
 
-    print("[*] UI not built. Building now (this takes ~15s)…")
+    print("[*] UI not built. Building now (this takes ~60s)…")
     # Install node_modules if missing
     if not (ui_src / "node_modules").exists():
         print("[*] Installing UI dependencies…")
@@ -915,14 +883,46 @@ def _ensure_ui_built() -> None:
         print(f"[!] UI build failed:\n{r.stderr[:500]}")
 
 
+# Build BEFORE route registration — routes are locked in at module load time
+_ensure_ui_built()
+
+if UI_DIST.exists():
+    # Mount static assets
+    app.mount("/controller/assets", StaticFiles(directory=str(UI_DIST / "assets")), name="assets")
+
+    @app.get("/controller/ui")
+    @app.get("/controller/ui/{path:path}")
+    async def serve_ui(path: str = ""):
+        index = UI_DIST / "index.html"
+        if index.exists():
+            return FileResponse(str(index))
+        return JSONResponse(
+            {"error": "UI not built. Run: cd ui && npm run build"},
+            status_code=503,
+        )
+else:
+    @app.get("/controller/ui")
+    @app.get("/controller/ui/{path:path}")
+    async def serve_ui_placeholder(path: str = ""):
+        return JSONResponse(
+            {
+                "error": "UI not built yet. npm may be missing — install Node.js 18+ and restart.",
+                "controller_api": "/api/controller/status",
+            },
+            status_code=503,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Bik AI Controller Server")
     parser.add_argument("--port", type=int, default=int(os.getenv("CONTROLLER_PORT", "8001")))
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
-
-    # Auto-build UI if dist is missing
-    _ensure_ui_built()
 
     # Auto-create .env with a generated API key if it doesn't exist or key is blank
     if not _read_env("API_KEY"):
