@@ -225,7 +225,7 @@ def start(model, parallel, port, ctx, threads, daemon):
 
     if daemon:
         log = LOG_FILE.open("w")
-        proc = subprocess.Popen(cmd, stdout=log, stderr=log)
+        proc = subprocess.Popen(cmd, stdout=log, stderr=log, start_new_session=True)
         PID_FILE.write_text(str(proc.pid))
         _ok(f"Server started in background  (PID {proc.pid})")
         _info(f"Logs:      tail -f {LOG_FILE}")
@@ -625,6 +625,28 @@ server {{
     listen 80;
     server_name {server_name};
 
+    # ── Controller UI & management API ────────────────────────
+    location /controller {{
+        proxy_pass http://127.0.0.1:{ctrl_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }}
+
+    location /api/controller {{
+        proxy_pass http://127.0.0.1:{ctrl_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }}
+
+    # ── AI inference API ──────────────────────────────────────
     location / {{
         proxy_pass http://127.0.0.1:{port};
         proxy_http_version 1.1;
@@ -659,10 +681,11 @@ server {{
 
 @cli.command()
 @click.option("--domain", "-d", default=lambda: _read_env("DOMAIN"), required=False, help="Domain or public IP (omit to auto-detect public IP)")
-@click.option("--port",         default=lambda: _read_env("PORT", "8000"),            help="FastAPI port to proxy to")
+@click.option("--port",         default=lambda: _read_env("PORT", "8000"),            help="AI server port to proxy to")
+@click.option("--ctrl-port",    default=lambda: _read_env("CTRL_PORT", "8001"),        help="Controller port to proxy to")
 @click.option("--ssl",          is_flag=True, default=False,                           help="Obtain HTTPS cert via Let's Encrypt (certbot, requires a domain)")
 @click.option("--status",       is_flag=True, default=False,                           help="Show nginx status and exit")
-def nginx(domain, port, ssl, status):
+def nginx(domain, port, ctrl_port, ssl, status):
     """Configure nginx as a reverse proxy for the API server.
 
     \b
@@ -729,7 +752,7 @@ def nginx(domain, port, ssl, status):
     is_ip = bool(_re.match(r"^\d{1,3}(\.\d{1,3}){3}$", domain))
     server_name = "_" if is_ip else domain
 
-    conf_content = NGINX_CONF_TEMPLATE.format(server_name=server_name, port=port)
+    conf_content = NGINX_CONF_TEMPLATE.format(server_name=server_name, port=port, ctrl_port=ctrl_port)
 
     _info(f"Writing nginx config: {conf_path}")
     try:
@@ -818,6 +841,307 @@ def logs(lines, follow):
         subprocess.run(["tail", f"-n{lines}", "-f", str(LOG_FILE)], check=False)
     else:
         subprocess.run(["tail", f"-n{lines}", str(LOG_FILE)], check=False)
+
+
+# ---------------------------------------------------------------------------
+# controller group — manage the always-running management server
+# ---------------------------------------------------------------------------
+
+CTRL_PID_FILE = Path(".bikai-ctrl.pid")
+
+
+def _ctrl_url() -> str:
+    port = _read_env("CONTROLLER_PORT", "8001")
+    return f"http://localhost:{port}"
+
+
+def _ctrl_is_running() -> bool:
+    try:
+        r = httpx.get(f"{_ctrl_url()}/controller/health", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _read_ctrl_pid() -> int | None:
+    if CTRL_PID_FILE.exists():
+        try:
+            return int(CTRL_PID_FILE.read_text().strip())
+        except ValueError:
+            pass
+    return None
+
+
+@cli.group()
+def controller():
+    """Manage the controller (management UI) server."""
+    pass
+
+
+@controller.command("start")
+@click.option("--port", "-p", default=lambda: int(_read_env("CONTROLLER_PORT", "8001")),
+              show_default=True, help="Controller port")
+@click.option("--host", default="0.0.0.0", show_default=True, help="Bind host")
+def controller_start(port, host):
+    """Start the controller server in background (daemon mode)."""
+    _header("Starting Bik AI Controller")
+
+    if _ctrl_is_running():
+        _warn("Controller is already running.")
+        _info(f"UI: {_ctrl_url()}/controller/ui")
+        return
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).parent / "controller.py"),
+        "--port", str(port),
+        "--host", host,
+    ]
+    _write_env("CONTROLLER_PORT", str(port))
+    log_path = Path("bikai-controller.log")
+    log_fh = log_path.open("w")
+    proc = subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh, start_new_session=True)
+    CTRL_PID_FILE.write_text(str(proc.pid))
+    _ok(f"Controller started  (PID {proc.pid})")
+    _info(f"UI:    http://localhost:{port}/controller/ui")
+    _info(f"API:   http://localhost:{port}/api/controller/status")
+    _info(f"Logs:  tail -f {log_path}")
+    _info("Stop with:  bikai controller stop")
+
+
+@controller.command("stop")
+def controller_stop():
+    """Stop the controller server."""
+    _header("Stopping Controller")
+
+    pid = _read_ctrl_pid()
+    stopped = False
+
+    if pid:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+                time.sleep(0.8)
+            except ProcessLookupError:
+                break
+        CTRL_PID_FILE.unlink(missing_ok=True)
+        _ok(f"Process {pid} terminated.")
+        stopped = True
+
+    port = _read_env("CONTROLLER_PORT", "8001")
+    result = subprocess.run(["fuser", f"{port}/tcp"], capture_output=True, text=True)
+    for p in result.stdout.strip().split():
+        try:
+            os.kill(int(p), signal.SIGTERM)
+            stopped = True
+        except (ValueError, ProcessLookupError):
+            pass
+
+    if stopped:
+        _ok("Controller stopped.")
+    else:
+        _warn("No running controller found.")
+
+
+@controller.command("status")
+def controller_status():
+    """Show controller server status."""
+    _header("Controller Status")
+    running = _ctrl_is_running()
+    pid = _read_ctrl_pid()
+    port = _read_env("CONTROLLER_PORT", "8001")
+
+    label = click.style("RUNNING", fg="green", bold=True) if running \
+        else click.style("STOPPED", fg="red", bold=True)
+
+    click.echo(f"\n  Status : {label}")
+    if pid:
+        click.echo(f"  PID    : {pid}")
+    click.echo(f"  Port   : {port}")
+    click.echo(f"  UI     : http://localhost:{port}/controller/ui")
+    click.echo()
+
+
+@controller.command("restart")
+@click.pass_context
+def controller_restart(ctx):
+    """Restart the controller server."""
+    ctx.invoke(controller_stop)
+    time.sleep(1)
+    ctx.invoke(controller_start)
+
+
+# ---------------------------------------------------------------------------
+# up  —  start everything with one command
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--api-port",   default=lambda: int(_read_env("PORT", "8000")),            show_default=True, help="AI server port")
+@click.option("--ctrl-port",  default=lambda: int(_read_env("CONTROLLER_PORT", "8001")), show_default=True, help="Controller port")
+@click.option("--parallel",   default=lambda: int(_read_env("N_PARALLEL", "4")),         show_default=True, help="Parallel AI slots")
+@click.option("--threads",    default=lambda: int(_read_env("N_THREADS", str(os.cpu_count() or 4))), show_default=True, help="CPU threads")
+@click.option("--ctx",        default=lambda: int(_read_env("N_CTX", "4096")),           show_default=True, help="Context length")
+def up(api_port, ctrl_port, parallel, threads, ctx):
+    """Start everything: controller + AI server (if model is configured).
+
+    \b
+    This is the one-command startup. Run once, then use the browser UI.
+
+      bikai up                  # start all with defaults from .env
+      bikai up --api-port 8080  # custom port
+
+    The controller UI is always available at http://localhost:<ctrl-port>/controller/ui
+    From there you can download models, start/stop the AI server, and manage nginx.
+    """
+    _header("Starting Bik AI")
+
+    # ── 1. Controller (always) ────────────────────────────────────────────
+    ctrl_already = _ctrl_is_running()
+    if ctrl_already:
+        _warn(f"Controller already running on port {_read_env('CONTROLLER_PORT', str(ctrl_port))}")
+    else:
+        _write_env("CONTROLLER_PORT", str(ctrl_port))
+        cmd = [
+            sys.executable,
+            str(Path(__file__).parent / "controller.py"),
+            "--port", str(ctrl_port),
+        ]
+        log_path = Path("bikai-controller.log")
+        proc = subprocess.Popen(cmd, stdout=log_path.open("w"), stderr=subprocess.STDOUT, start_new_session=True)
+        CTRL_PID_FILE.write_text(str(proc.pid))
+        _ok(f"Controller started (PID {proc.pid})")
+
+        # Wait up to 10s for controller to be ready
+        for _ in range(10):
+            try:
+                if httpx.get(f"http://localhost:{ctrl_port}/controller/health", timeout=1).status_code == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            _warn("Controller didn't respond in 10s — check logs: tail -f bikai-controller.log")
+
+    # ── 2. AI server (only if model is configured) ────────────────────────
+    model = _read_env("MODEL_PATH")
+    ai_started = False
+
+    if not model:
+        click.echo()
+        _info("No MODEL_PATH in .env — AI server not started.")
+        _info("Download a model from the controller UI, then the server will start automatically.")
+    else:
+        # Resolve path
+        if not Path(model).is_file():
+            candidates = [MODELS_DIR / model, MODELS_DIR / (model + ".gguf")]
+            model = next((str(p) for p in candidates if p.is_file()), model)
+
+        if not Path(model).is_file():
+            _warn(f"Model file not found: {model}")
+            _info("Download a model from the controller UI first.")
+        elif _is_running():
+            _warn(f"AI server already running on port {_read_env('PORT', str(api_port))}")
+        else:
+            _write_env("PORT", str(api_port))
+            cmd = [
+                sys.executable, "server.py",
+                "--model",    model,
+                "--parallel", str(parallel),
+                "--port",     str(api_port),
+                "--ctx",      str(ctx),
+                "--threads",  str(threads),
+            ]
+            log = LOG_FILE.open("w")
+            proc = subprocess.Popen(cmd, stdout=log, stderr=log, start_new_session=True)
+            PID_FILE.write_text(str(proc.pid))
+            _ok(f"AI server started  (PID {proc.pid})  model: {Path(model).name}")
+            ai_started = True
+
+            # Wait up to 60s for AI server (model loading takes time)
+            _info("Waiting for AI server to load model (this may take 30-60s)...")
+            for _ in range(60):
+                try:
+                    if httpx.get(f"http://localhost:{api_port}/health", timeout=1).status_code == 200:
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            else:
+                _warn("AI server didn't respond in 60s — check logs: tail -f bikai-server.log")
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    click.echo()
+    click.echo(f"  {click.style('──────────────────────────────────────', fg='cyan')}")
+    click.echo(f"  {click.style('Bik AI is running!', fg='green', bold=True)}")
+    click.echo(f"  {click.style('──────────────────────────────────────', fg='cyan')}")
+    click.echo()
+    click.echo(f"  Controller UI  : {click.style(f'http://localhost:{ctrl_port}/controller/ui', fg='cyan')}")
+    if ai_started or _is_running():
+        click.echo(f"  AI API         : {click.style(f'http://localhost:{api_port}', fg='cyan')}")
+        click.echo(f"  API docs       : {click.style(f'http://localhost:{api_port}/docs', fg='cyan')}")
+    click.echo()
+    click.echo(f"  Logs:  tail -f bikai-controller.log   tail -f bikai-server.log")
+    click.echo(f"  Stop:  {click.style('bikai down', bold=True)}")
+    click.echo()
+
+
+# ---------------------------------------------------------------------------
+# down  —  stop everything
+# ---------------------------------------------------------------------------
+
+@cli.command()
+def down():
+    """Stop everything: AI server + controller.
+
+    \b
+    Stops both the AI inference server and the controller UI server.
+    """
+    _header("Stopping Bik AI")
+
+    # Stop AI server
+    pid = _read_pid()
+    if pid:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+                time.sleep(0.8)
+            except ProcessLookupError:
+                break
+        PID_FILE.unlink(missing_ok=True)
+        _ok(f"AI server (PID {pid}) stopped.")
+    else:
+        port = _read_env("PORT", "8000")
+        result = subprocess.run(["fuser", f"{port}/tcp"], capture_output=True, text=True)
+        for p in result.stdout.strip().split():
+            try:
+                os.kill(int(p), signal.SIGTERM)
+                _ok(f"AI server (PID {p}) stopped.")
+            except (ValueError, ProcessLookupError):
+                pass
+
+    # Stop controller
+    ctrl_pid = _read_ctrl_pid()
+    if ctrl_pid:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(ctrl_pid, sig)
+                time.sleep(0.8)
+            except ProcessLookupError:
+                break
+        CTRL_PID_FILE.unlink(missing_ok=True)
+        _ok(f"Controller (PID {ctrl_pid}) stopped.")
+    else:
+        port = _read_env("CONTROLLER_PORT", "8001")
+        result = subprocess.run(["fuser", f"{port}/tcp"], capture_output=True, text=True)
+        for p in result.stdout.strip().split():
+            try:
+                os.kill(int(p), signal.SIGTERM)
+                _ok(f"Controller (PID {p}) stopped.")
+            except (ValueError, ProcessLookupError):
+                pass
+
+    _ok("All stopped.")
+    click.echo()
 
 
 # ---------------------------------------------------------------------------

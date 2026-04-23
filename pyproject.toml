@@ -22,6 +22,7 @@ dependencies = [
 
 [project.scripts]
 bikai = "cli:cli"
+bikai-controller = "controller:app"
 
 [tool.setuptools]
-py-modules = ["cli"]
+py-modules = ["cli", "controller", "server"]

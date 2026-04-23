@@ -121,13 +121,14 @@ ensure_python
 step "2/5" "Checking build tools"
 
 ensure_build_deps() {
-  local need_cmake=false need_nginx=false need_blas=false need_cc=false
+  local need_cmake=false need_nginx=false need_blas=false need_cc=false need_node=false
   command -v cmake   &>/dev/null || need_cmake=true
   command -v nginx   &>/dev/null || need_nginx=true
   command -v gcc     &>/dev/null || need_cc=true
+  command -v npm     &>/dev/null || need_node=true
   pkg-config --exists openblas 2>/dev/null   || need_blas=true
 
-  if ! $need_cmake && ! $need_nginx && ! $need_blas && ! $need_cc; then
+  if ! $need_cmake && ! $need_nginx && ! $need_blas && ! $need_cc && ! $need_node; then
     ok "Build tools already installed — skipping"; return
   fi
 
@@ -141,6 +142,27 @@ ensure_build_deps() {
     *)      warn "Skipping build tools. If install fails, install cmake + openblas manually." ;;
   esac
   ok "Build tools ready"
+
+  # Node.js — required to build the React controller UI
+  if ! command -v npm &>/dev/null; then
+    info "Installing Node.js..."
+    case $OS in
+      debian)
+        # Use NodeSource LTS (Node 20)
+        curl -fsSL https://deb.nodesource.com/setup_lts.x | $SUDO -E bash - &>/dev/null
+        $SUDO apt-get install -y -qq nodejs
+        ;;
+      fedora) $SUDO dnf install -y -q nodejs npm ;;
+      rhel)   $SUDO yum install -y -q nodejs npm ;;
+      arch)   $SUDO pacman -Sy --noconfirm nodejs npm ;;
+      suse)   $SUDO zypper install -y nodejs npm ;;
+      macos)  brew install node ;;
+      *)      warn "Could not install Node.js automatically. Install Node.js 18+ and re-run." ;;
+    esac
+    command -v npm &>/dev/null && ok "Node.js installed" || warn "Node.js install failed — UI build will be skipped"
+  else
+    ok "Node.js already installed"
+  fi
 }
 ensure_build_deps
 
@@ -244,6 +266,7 @@ header "Auto Setup"
 
 GDRIVE_ID="1kO_KTjQ-GcaarzLxqXnUyJkEmbM6UC3d"
 API_PORT="8000"
+CTRL_PORT="8001"
 PARALLEL="4"
 
 # Step A: Download model from Google Drive (skip if already present)
@@ -266,65 +289,113 @@ else
   MODEL_FILE=$(find "$INSTALL_DIR/models" -name "*.gguf" | sort | head -1)
 fi
 if [[ -z "$MODEL_FILE" ]]; then
-  warn "No model found in $INSTALL_DIR/models — start the server manually after downloading a model."
+  warn "No model found in $INSTALL_DIR/models — you can download one from the controller UI after setup."
 else
   ok "Model: $(basename "$MODEL_FILE")"
 
-  # Save model path to .env
+  step "B" "Saving model config..."
   "$INSTALL_DIR/venv/bin/python" - <<PYEOF
 from dotenv import set_key
 set_key("$INSTALL_DIR/.env", "MODEL_PATH", "$MODEL_FILE")
 set_key("$INSTALL_DIR/.env", "PORT", "$API_PORT")
 set_key("$INSTALL_DIR/.env", "N_PARALLEL", "$PARALLEL")
 PYEOF
-
-  # Step B: Start the server in daemon mode
-  step "B" "Starting Bik AI server (parallel=$PARALLEL, port=$API_PORT)..."
-  # Disable set -e for the start command — we handle failure ourselves
-  set +e
-  "$BIN_DIR/bikai" start \
-    --model "$MODEL_FILE" \
-    --parallel "$PARALLEL" \
-    --port "$API_PORT" \
-    --daemon
-  START_EXIT=$?
-  set -e
-
-  if [[ $START_EXIT -ne 0 ]]; then
-    warn "bikai start returned an error. Last log lines:"
-    echo ""
-    tail -30 "$INSTALL_DIR/bikai-server.log" 2>/dev/null | sed 's/^/    /' || true
-    echo ""
-    warn "Fix the issue then run:  bikai start --model '$MODEL_FILE' --parallel $PARALLEL --daemon"
-  else
-    # Wait up to 30s for the health endpoint to respond
-    info "Waiting for server to be ready..."
-    READY=false
-    for i in $(seq 1 30); do
-      if curl -sf "http://localhost:$API_PORT/health" &>/dev/null; then
-        READY=true
-        break
-      fi
-      sleep 1
-    done
-
-    if $READY; then
-      ok "Server is up and healthy"
-    else
-      warn "Server did not respond after 30 seconds. Last log lines:"
-      echo ""
-      tail -30 "$INSTALL_DIR/bikai-server.log" 2>/dev/null | sed 's/^/    /' || true
-      echo ""
-      warn "Fix the issue then run:  bikai start --model '$MODEL_FILE' --parallel $PARALLEL --daemon"
-    fi
-  fi
+  ok "Config saved to .env"
 fi
 
-# Step C: Setup nginx
+# Step B2: Build the React UI
+step "B2" "Building Controller UI..."
+if command -v npm &>/dev/null && [[ -d "$INSTALL_DIR/ui" ]]; then
+  pushd "$INSTALL_DIR/ui" > /dev/null
+  info "Running npm install..."
+  npm install --silent 2>&1 | tail -3 || true
+  info "Building React app..."
+  npm run build 2>&1 | tail -5 || warn "UI build failed — controller will serve without UI assets"
+  popd > /dev/null
+  ok "UI built."
+else
+  warn "npm not found — skipping UI build. Install Node.js 18+ and re-run setup.sh."
+fi
+
+# Step B3: Start everything with a single bikai up
+step "B3" "Starting controller + AI server..."
+set +e
+"$BIN_DIR/bikai" up --api-port "$API_PORT" --ctrl-port "$CTRL_PORT" --parallel "$PARALLEL"
+UP_EXIT=$?
+set -e
+
+if [[ $UP_EXIT -ne 0 ]]; then
+  warn "bikai up failed. Try manually:  bikai up"
+fi
+
+# Step C: Setup nginx (proxies both / → AI port and /controller → controller port)
 step "C" "Configuring nginx reverse proxy..."
-"$BIN_DIR/bikai" nginx --port "$API_PORT" || {
+"$BIN_DIR/bikai" nginx --port "$API_PORT" --ctrl-port "$CTRL_PORT" || {
   warn "nginx setup failed. Run manually:  bikai nginx"
 }
+
+# Step D: Create systemd services for auto-start on reboot
+step "D" "Setting up auto-start on reboot (systemd)..."
+if command -v systemctl &>/dev/null && systemctl is-system-running --quiet 2>/dev/null || \
+   command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
+
+  SYSTEMD_DIR="/etc/systemd/system"
+  CURRENT_USER="$(whoami)"
+
+  # Controller service — always auto-start
+  $SUDO tee "$SYSTEMD_DIR/bikai-controller.service" > /dev/null <<SERVICE_EOF
+[Unit]
+Description=BikAI Controller (management UI)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$CURRENT_USER
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/controller.py --port $CTRL_PORT
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+
+  # AI server service — auto-start only if a model is already configured
+  if [[ -n "$MODEL_FILE" && -f "$MODEL_FILE" ]]; then
+    $SUDO tee "$SYSTEMD_DIR/bikai.service" > /dev/null <<SERVICE_EOF
+[Unit]
+Description=BikAI Inference Server
+After=network.target bikai-controller.service
+Wants=bikai-controller.service
+
+[Service]
+Type=simple
+User=$CURRENT_USER
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/server.py --model $MODEL_FILE --parallel $PARALLEL --port $API_PORT
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable bikai-controller.service bikai.service 2>/dev/null
+    ok "Systemd services enabled: bikai-controller + bikai (auto-start on reboot)"
+  else
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable bikai-controller.service 2>/dev/null
+    ok "Systemd service enabled: bikai-controller (auto-start on reboot)"
+    info "AI server will need to be started manually with: bikai start"
+  fi
+else
+  warn "systemd not detected — skipping auto-start setup. Start manually with: bikai controller start"
+fi
 
 # Get public IP for display
 PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || echo "your-server-ip")
@@ -334,10 +405,10 @@ echo -e "  ${GREEN}${BOLD}══════════════════
 echo -e "  ${GREEN}${BOLD}  Bik AI is live!${NC}"
 echo -e "  ${GREEN}${BOLD}══════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "  Public IP  : ${CYAN}http://$PUBLIC_IP${NC}"
-echo -e "  Server info: ${CYAN}http://$PUBLIC_IP/server/info${NC}"
-echo -e "  API docs   : ${CYAN}http://$PUBLIC_IP/docs${NC}"
-echo -e "  Health     : ${CYAN}http://$PUBLIC_IP/health${NC}"
+echo -e "  Public IP      : ${CYAN}http://$PUBLIC_IP${NC}"
+echo -e "  Control Panel  : ${CYAN}http://$PUBLIC_IP/controller/ui${NC}"
+echo -e "  API docs       : ${CYAN}http://$PUBLIC_IP/docs${NC}"
+echo -e "  Health         : ${CYAN}http://$PUBLIC_IP/health${NC}"
 echo ""
 echo -e "  Your API key:"
 "$BIN_DIR/bikai" token show 2>/dev/null || true

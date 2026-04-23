@@ -4,3 +4,5 @@ pydantic>=2.7.0
 python-dotenv>=1.0.1
 slowapi>=0.1.9
 llama-cpp-python>=0.2.90
+httpx>=0.27.0
+gdown>=5.1.0

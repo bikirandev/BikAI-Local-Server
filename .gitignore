@@ -37,3 +37,15 @@ Thumbs.db
 # Logs & core dumps
 *.log
 core
+
+# Runtime PID files
+.bikai.pid
+.bikai-ctrl.pid
+.bikai-dl.pid
+
+# UI build output & dependencies (built during setup)
+ui/dist/
+ui/node_modules/
+
+# nohup output
+nohup.out
