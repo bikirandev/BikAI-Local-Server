@@ -31,6 +31,7 @@ import re
 import resource
 import secrets
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -856,7 +857,19 @@ def _ensure_ui_built() -> None:
         print("[!] ui/package.json not found — skipping UI build")
         return
 
-    npm = subprocess.run(["which", "npm"], capture_output=True, text=True).stdout.strip()
+    # shutil.which works even in daemons where PATH is minimal
+    npm = shutil.which("npm")
+    if not npm:
+        # Try well-known install locations (NodeSource, nvm, homebrew, etc.)
+        for candidate in [
+            "/usr/bin/npm",
+            "/usr/local/bin/npm",
+            "/opt/homebrew/bin/npm",
+            "/snap/bin/npm",
+        ]:
+            if Path(candidate).exists():
+                npm = candidate
+                break
     if not npm:
         print("[!] npm not found — cannot auto-build UI. Install Node.js 18+ and re-run setup.sh")
         return

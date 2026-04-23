@@ -301,9 +301,18 @@ if command -v npm &>/dev/null && [[ -d "$INSTALL_DIR/ui" ]]; then
   npm install --silent --no-progress 2>/dev/null || npm install --silent 2>&1 | grep -E 'error|warn' | head -5 || true
   ok "Dependencies installed."
   info "Compiling UI (this takes ~10s)..."
-  npm run build --silent 2>/dev/null || npm run build 2>&1 | grep -E 'error|built in|✓' | tail -5 || warn "UI build failed — controller will serve without UI assets"
+  if npm run build 2>&1 | tee /tmp/bikai-ui-build.log | grep -E 'error|built in|✓' | tail -5; then
+    ok "UI compiled."
+  else
+    warn "UI build had warnings — checking for output..."
+    if [[ -f "$INSTALL_DIR/ui/dist/index.html" ]]; then
+      ok "UI compiled (with warnings)."
+    else
+      warn "UI build FAILED — check /tmp/bikai-ui-build.log"
+      warn "The controller will attempt to build the UI on first start."
+    fi
+  fi
   popd > /dev/null
-  ok "UI compiled."
 else
   warn "npm not found — skipping UI build. Install Node.js 18+ and re-run setup.sh."
 fi

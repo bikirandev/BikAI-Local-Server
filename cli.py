@@ -1035,6 +1035,8 @@ def up(api_port, ctrl_port, parallel, threads, ctx):
     if ctrl_already:
         _warn(f"Controller already running on port {_read_env('CONTROLLER_PORT', str(ctrl_port))}")
     else:
+        # Build UI before spawning daemon — daemon PATH may not include npm
+        _auto_build_ui()
         _write_env("CONTROLLER_PORT", str(ctrl_port))
         cmd = [
             sys.executable,
