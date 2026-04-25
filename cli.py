@@ -157,6 +157,7 @@ def cli():
     Info:
       bikai url                                    (show local + public URL)
       bikai config                                 (show all settings including parallel count)
+      bikai update                                 (git pull + rebuild UI + restart services)
 
     \b
     Parallel slots (how many users at once):
@@ -1179,6 +1180,215 @@ def down():
 
     _ok("All stopped.")
     click.echo()
+
+
+# ---------------------------------------------------------------------------
+# update  —  git pull + rebuild UI + restart services
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--no-restart", is_flag=True, default=False, help="Pull and rebuild only — do not restart services")
+@click.option("--skip-ui",    is_flag=True, default=False, help="Skip UI rebuild (faster, use when only Python changed)")
+def update(no_restart, skip_ui):
+    """Pull latest changes from git, rebuild UI, and restart services.
+
+    \b
+    Run this on your server after pushing code changes:
+
+      bikai update               # full update: pull + rebuild + restart
+      bikai update --skip-ui     # skip UI rebuild (Python-only changes)
+      bikai update --no-restart  # pull and build only, no restart
+
+    Services are restarted only if they were running before the update.
+    The AI server keeps its current model and configuration.
+    """
+    _header("Updating Bik AI")
+
+    base = Path(__file__).parent
+
+    # ── 0. Confirm git repo ────────────────────────────────────────────────
+    if not (base / ".git").exists():
+        _err("Not a git repository. Was this installed with setup.sh?")
+        _info("Expected location: ~/.bikai")
+        return
+
+    # ── 1. Check running state before touching anything ────────────────────
+    ctrl_was_running = _ctrl_is_running()
+    ai_was_running   = _is_running()
+
+    click.echo()
+    click.echo(f"  Controller : {'running' if ctrl_was_running else 'stopped'}")
+    click.echo(f"  AI server  : {'running' if ai_was_running   else 'stopped'}")
+    click.echo()
+
+    # ── 2. git pull ────────────────────────────────────────────────────────
+    _info("Pulling latest changes from git…")
+    result = subprocess.run(
+        ["git", "pull", "--ff-only"],
+        cwd=str(base),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        _err(f"git pull failed:\n{result.stderr.strip()}")
+        _info("Fix any conflicts manually, then run 'bikai update' again.")
+        return
+
+    pull_output = result.stdout.strip()
+    if "Already up to date" in pull_output:
+        _ok("Already up to date.")
+    else:
+        for line in pull_output.splitlines():
+            click.echo(f"    {line}")
+        _ok("Code updated.")
+
+    # ── 3. Rebuild UI (if changed or requested) ────────────────────────────
+    if skip_ui:
+        _info("Skipping UI rebuild (--skip-ui)")
+    else:
+        ui_src = base / "ui"
+        if not (ui_src / "package.json").exists():
+            _info("No ui/package.json found — skipping UI build.")
+        else:
+            npm = subprocess.run(["which", "npm"], capture_output=True, text=True).stdout.strip()
+            if not npm:
+                _warn("npm not found — skipping UI rebuild. Install Node.js 18+ to rebuild.")
+            else:
+                _info("Rebuilding UI…")
+                # Only npm install if package.json was touched by the pull
+                pkg_changed = "package.json" in pull_output or not (ui_src / "node_modules").exists()
+                if pkg_changed:
+                    _info("package.json changed — running npm install…")
+                    r = subprocess.run(
+                        [npm, "install", "--silent"],
+                        cwd=str(ui_src),
+                        capture_output=True,
+                        text=True,
+                    )
+                    if r.returncode != 0:
+                        _warn(f"npm install failed:\n{r.stderr[:400]}")
+
+                r = subprocess.run(
+                    [npm, "run", "build"],
+                    cwd=str(ui_src),
+                    capture_output=True,
+                    text=True,
+                )
+                if r.returncode == 0:
+                    _ok("UI rebuilt.")
+                else:
+                    _warn(f"UI build failed:\n{r.stderr[:400]}")
+                    _warn("Controller will use the previous UI until this is fixed.")
+
+    if no_restart:
+        _ok("Update complete (services not restarted — --no-restart)")
+        click.echo()
+        return
+
+    # ── 4. Restart services ────────────────────────────────────────────────
+    if not ctrl_was_running and not ai_was_running:
+        _ok("No services were running — nothing to restart.")
+        _info("Start everything with:  bikai up")
+        click.echo()
+        return
+
+    # Stop controller
+    if ctrl_was_running:
+        _info("Stopping controller…")
+        ctrl_pid = _read_ctrl_pid()
+        if ctrl_pid:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.kill(ctrl_pid, sig)
+                    time.sleep(0.8)
+                except ProcessLookupError:
+                    break
+            CTRL_PID_FILE.unlink(missing_ok=True)
+        else:
+            # Fallback: kill by port
+            port = _read_env("CONTROLLER_PORT", "8001")
+            try:
+                r = subprocess.run(["fuser", f"{port}/tcp"], capture_output=True, text=True)
+                for p in r.stdout.strip().split():
+                    os.kill(int(p), signal.SIGTERM)
+            except Exception:
+                pass
+        time.sleep(1)
+
+    # Restart controller
+    if ctrl_was_running:
+        _info("Restarting controller…")
+        ctrl_port = int(_read_env("CONTROLLER_PORT", "8001"))
+        cmd = [
+            sys.executable,
+            str(base / "controller.py"),
+            "--port", str(ctrl_port),
+        ]
+        log_path = base / "bikai-controller.log"
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_path.open("w"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=str(base),
+        )
+        CTRL_PID_FILE.write_text(str(proc.pid))
+        _ok(f"Controller restarted (PID {proc.pid})")
+
+        # Wait for controller to be ready
+        for _ in range(10):
+            try:
+                if httpx.get(f"http://localhost:{ctrl_port}/controller/health", timeout=1).status_code == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+    # Restart AI server if it was running
+    if ai_was_running:
+        _info("Restarting AI server…")
+        model   = _read_env("MODEL_PATH")
+        port    = int(_read_env("PORT", "8000"))
+        par     = int(_read_env("N_PARALLEL", "4"))
+        ctx     = int(_read_env("N_CTX", "4096"))
+        threads = int(_read_env("N_THREADS", str(os.cpu_count() or 4)))
+
+        if not model or not Path(model).is_file():
+            _warn(f"MODEL_PATH not found ({model}) — AI server not restarted.")
+            _info("Use the controller UI or 'bikai start' to restart it manually.")
+        else:
+            # Kill existing
+            ai_pid = _read_pid()
+            if ai_pid:
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.kill(ai_pid, sig)
+                        time.sleep(0.8)
+                    except ProcessLookupError:
+                        break
+                PID_FILE.unlink(missing_ok=True)
+
+            cmd = [
+                sys.executable, str(base / "server.py"),
+                "--model",    model,
+                "--parallel", str(par),
+                "--port",     str(port),
+                "--ctx",      str(ctx),
+                "--threads",  str(threads),
+            ]
+            log = (base / "bikai-server.log").open("w")
+            proc = subprocess.Popen(cmd, stdout=log, stderr=log, start_new_session=True, cwd=str(base))
+            PID_FILE.write_text(str(proc.pid))
+            _ok(f"AI server restarted (PID {proc.pid})  model: {Path(model).name}")
+            _info("Model loading in background — check: tail -f bikai-server.log")
+
+    # ── 5. Summary ─────────────────────────────────────────────────────────
+    click.echo()
+    click.echo(click.style(f"  {'─'*40}", fg="cyan"))
+    click.echo(click.style("  Update complete!", fg="green", bold=True))
+    click.echo(click.style(f"  {'─'*40}", fg="cyan"))
+    ctrl_port = _read_env("CONTROLLER_PORT", "8001")
+    click.echo(f"\n  Controller UI : http://localhost:{ctrl_port}/controller/ui\n")
 
 
 # ---------------------------------------------------------------------------
