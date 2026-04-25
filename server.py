@@ -235,7 +235,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     model: Optional[str] = None
     messages: List[Message] = Field(..., min_length=1, max_length=50)
-    stream: bool = False
+    stream: bool = True
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=2048, ge=1, le=8192)
 
@@ -243,7 +243,7 @@ class ChatRequest(BaseModel):
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=32_768)
     model: Optional[str] = None
-    stream: bool = False
+    stream: bool = True
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=2048, ge=1, le=8192)
 
