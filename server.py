@@ -173,15 +173,34 @@ app.add_middleware(
 # Authentication
 # ---------------------------------------------------------------------------
 
-_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+_api_key_header  = APIKeyHeader(name="X-API-Key",     auto_error=False)
+_bearer_header   = APIKeyHeader(name="Authorization", auto_error=False)
 
 
-async def require_api_key(key: str = Depends(_api_key_header)) -> str:
+async def require_api_key(
+    x_api_key: str | None = Depends(_api_key_header),
+    authorization: str | None = Depends(_bearer_header),
+) -> str:
+    # Prefer Bearer token (OpenAI-compatible), fall back to X-API-Key
+    token: str | None = None
+    if authorization:
+        if authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+        else:
+            token = authorization.strip()
+    elif x_api_key:
+        token = x_api_key.strip()
+
+    if not token:
+        raise HTTPException(
+            status_code=403,
+            detail="Missing API key. Provide 'Authorization: Bearer <key>' or 'X-API-Key: <key>'.",
+        )
     if not _config["api_key"]:
         raise HTTPException(status_code=500, detail="Server API key not configured.")
-    if not secrets.compare_digest(key, _config["api_key"]):
+    if not secrets.compare_digest(token, _config["api_key"]):
         raise HTTPException(status_code=401, detail="Invalid API key.")
-    return key
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +216,7 @@ async def options_handler(_path: str = ""):
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*, X-API-Key, Content-Type, ngrok-skip-browser-warning",
+            "Access-Control-Allow-Headers": "*, Authorization, X-API-Key, Content-Type",
             "Access-Control-Max-Age": "86400",
         },
     )
