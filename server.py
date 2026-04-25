@@ -31,7 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, Any, List, Optional, Union
 
 import uvicorn
 from dotenv import load_dotenv, set_key
@@ -228,16 +228,37 @@ async def options_handler(_path: str = ""):
 
 
 class Message(BaseModel):
-    role: str = Field(..., pattern="^(system|user|assistant)$")
-    content: str = Field(..., min_length=1, max_length=32_768)
+    model_config = {"extra": "ignore"}
+    role: str = Field(..., pattern="^(system|user|assistant|tool|function)$")
+    # Accept plain string OR list-of-parts (OpenAI vision/multipart format)
+    content: Union[str, List[Any]] = Field(...)
+    name: Optional[str] = None
+
+    def text_content(self) -> str:
+        """Always return a plain string for llama-cpp."""
+        if isinstance(self.content, str):
+            return self.content
+        # Flatten list-of-parts: concatenate all text parts
+        parts = []
+        for part in self.content:
+            if isinstance(part, dict):
+                parts.append(part.get("text") or part.get("content") or "")
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(p for p in parts if p)
 
 
 class ChatRequest(BaseModel):
+    model_config = {"extra": "ignore"}  # ignore unknown OpenAI fields (tools, logprobs, etc.)
     model: Optional[str] = None
-    messages: List[Message] = Field(..., min_length=1, max_length=50)
+    messages: List[Message] = Field(..., min_length=1, max_length=500)
     stream: bool = True
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=2048, ge=1, le=8192)
+    max_tokens: int = Field(default=2048, ge=1, le=32768)
+    top_p: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    stop: Optional[Union[str, List[str]]] = None
 
 
 class GenerateRequest(BaseModel):
@@ -313,7 +334,7 @@ async def list_models():
 async def chat_completions(request: Request, body: ChatRequest):
     """OpenAI-compatible chat completions — supports streaming."""
     _ = request
-    messages = [{"role": m.role, "content": m.content} for m in body.messages]
+    messages = [{"role": m.role, "content": m.text_content()} for m in body.messages]
 
     pool: LlamaPool = _state["pool"]
 
