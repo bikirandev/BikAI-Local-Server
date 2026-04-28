@@ -97,7 +97,13 @@ ensure_python() {
     VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     MINOR=$(echo "$VER" | cut -d. -f2)
     if [[ $MINOR -ge $MIN_PY_MINOR ]]; then
-      ok "Python $VER found"; return
+      ok "Python $VER found"
+      # On Debian/Ubuntu, python3-venv is a separate package and may not be installed
+      # even when python3 is present — ensure it exists before we try to create a venv.
+      if [[ $OS == "debian" ]]; then
+        python3 -m venv --help &>/dev/null || pkg_install python3-venv python3-pip
+      fi
+      return
     fi
     warn "Python $VER found but 3.${MIN_PY_MINOR}+ required. Installing newer version..."
   else
