@@ -301,14 +301,31 @@ def _normalise_tool_calls(message: dict) -> dict:
                 except json.JSONDecodeError:
                     pass
 
-    # Format 3 & 4: JSON object with "name"+"arguments" keys (raw or in ```json block)
+    # Format 3 & 4: JSON object with "name"+"arguments" keys (raw, ```json block, or {{...}} wrapped)
     if not tool_calls:
-        candidates = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-        if not candidates:
-            candidates = re.findall(r"(\{[^{}]*\"name\"\s*:[^{}]*\"arguments\"\s*:[^{}]*\})", content, re.DOTALL)
-        for raw in candidates:
+        # Collect raw JSON candidates from various wrapping styles
+        raw_candidates: list[str] = []
+
+        # ```json ... ``` blocks
+        raw_candidates += re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+
+        # {{...}} — model wraps JSON in an extra layer of braces
+        stripped = content.strip()
+        if stripped.startswith("{{") and stripped.endswith("}}"):
+            raw_candidates.append(stripped[1:-1])
+
+        # bare JSON objects anywhere in the content
+        for m in re.finditer(r"\{", content):
             try:
-                obj = json.loads(raw)
+                obj, _ = json.JSONDecoder().raw_decode(content, m.start())
+                if isinstance(obj, dict):
+                    raw_candidates.append(json.dumps(obj))
+            except json.JSONDecodeError:
+                pass
+
+        for raw in raw_candidates:
+            try:
+                obj = json.loads(raw) if isinstance(raw, str) else raw
                 name = obj.get("name") or obj.get("function")
                 args = obj.get("arguments") or obj.get("parameters") or {}
                 if name and isinstance(args, (dict, str)):
@@ -320,6 +337,7 @@ def _normalise_tool_calls(message: dict) -> dict:
                             "arguments": json.dumps(args) if not isinstance(args, str) else args,
                         },
                     })
+                    break  # only need first valid tool call from this format
             except (json.JSONDecodeError, AttributeError):
                 pass
 
