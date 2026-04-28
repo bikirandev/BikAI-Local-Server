@@ -90,7 +90,7 @@ def ensure_api_key() -> None:
 def _make_instance(model_path: str, n_ctx: int, n_threads: int) -> Llama:
     return Llama(
         model_path=model_path,
-        n_ctx=min(n_ctx, 8192),  # cap at Gemma 2's max training context
+        n_ctx=n_ctx,
         n_threads=n_threads,
         n_gpu_layers=0,          # CPU-only (no CUDA on this machine)
         verbose=False,
@@ -112,7 +112,7 @@ class LlamaPool:
         # Divide threads evenly so instances don't fight for CPU
         per_instance_threads = max(1, n_threads // size)
         print(f"[*] Loading {size} model instance(s) from {model_path} ...")
-        print(f"    n_ctx={min(n_ctx, 8192)}  threads_per_instance={per_instance_threads}")
+        print(f"    n_ctx={n_ctx}  threads_per_instance={per_instance_threads}")
         self._queue: asyncio.Queue = asyncio.Queue()
         for i in range(size):
             print(f"    [{i+1}/{size}] loading...", flush=True)
