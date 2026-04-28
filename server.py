@@ -249,7 +249,7 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model_config = {"extra": "ignore"}  # ignore unknown OpenAI fields (tools, logprobs, etc.)
+    model_config = {"extra": "ignore"}  # ignore unknown OpenAI fields (logprobs, etc.)
     model: Optional[str] = None
     messages: List[Message] = Field(..., min_length=1, max_length=500)
     stream: bool = True
@@ -259,6 +259,8 @@ class ChatRequest(BaseModel):
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[Union[str, dict]] = None
 
 
 class GenerateRequest(BaseModel):
@@ -274,13 +276,20 @@ class GenerateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _run_chat_sync(llm: Llama, messages: list, temperature: float, max_tokens: int) -> dict:
-    return llm.create_chat_completion(
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=False,
-    )
+def _run_chat_sync(
+    llm: Llama,
+    messages: list,
+    temperature: float,
+    max_tokens: int,
+    tools: list | None = None,
+    tool_choice: str | dict | None = None,
+) -> dict:
+    kwargs: dict = dict(messages=messages, temperature=temperature, max_tokens=max_tokens, stream=False)
+    if tools:
+        kwargs["tools"] = tools
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
+    return llm.create_chat_completion(**kwargs)
 
 
 def _run_generate_sync(llm: Llama, prompt: str, temperature: float, max_tokens: int) -> dict:
@@ -340,7 +349,7 @@ async def chat_completions(request: Request, body: ChatRequest):
 
     if body.stream:
         return StreamingResponse(
-            _stream_chat(pool, messages, body.temperature, body.max_tokens),
+            _stream_chat(pool, messages, body.temperature, body.max_tokens, body.tools, body.tool_choice),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -348,7 +357,7 @@ async def chat_completions(request: Request, body: ChatRequest):
     llm = await pool.acquire()
     try:
         data = await _run_in_thread(
-            _run_chat_sync, llm, messages, body.temperature, body.max_tokens
+            _run_chat_sync, llm, messages, body.temperature, body.max_tokens, body.tools, body.tool_choice
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Inference error: {exc}") from exc
@@ -372,7 +381,12 @@ async def chat_completions(request: Request, body: ChatRequest):
 
 
 async def _stream_chat(
-    pool: LlamaPool, messages: list, temperature: float, max_tokens: int
+    pool: LlamaPool,
+    messages: list,
+    temperature: float,
+    max_tokens: int,
+    tools: list | None = None,
+    tool_choice: str | dict | None = None,
 ) -> AsyncGenerator[str, None]:
     llm = await pool.acquire()
     loop = asyncio.get_event_loop()
@@ -380,12 +394,12 @@ async def _stream_chat(
 
     def _produce():
         try:
-            for chunk in llm.create_chat_completion(
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-            ):
+            kwargs: dict = dict(messages=messages, temperature=temperature, max_tokens=max_tokens, stream=True)
+            if tools:
+                kwargs["tools"] = tools
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
+            for chunk in llm.create_chat_completion(**kwargs):
                 loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
         finally:
             loop.call_soon_threadsafe(chunk_queue.put_nowait, None)  # sentinel
