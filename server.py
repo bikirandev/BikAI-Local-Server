@@ -26,6 +26,7 @@ Recommended GGUF models (download from HuggingFace):
 import asyncio
 import json
 import os
+import re
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -248,8 +249,86 @@ class Message(BaseModel):
         return "\n".join(p for p in parts if p)
 
 
+# ---------------------------------------------------------------------------
+# Tool-call response normaliser
+# ---------------------------------------------------------------------------
+
+def _normalise_tool_calls(message: dict) -> dict:
+    """Convert XML/JSON-format tool calls (llama-cpp-python quirk) to OpenAI tool_calls format.
+
+    Handles all common formats that local models emit instead of proper tool_calls:
+      1. <tool_call>{"name": "fn", "arguments": {...}}</tool_call>
+      2. <xml><fn_name>{"arg": "val"}</fn_name></xml>
+      3. ```json\\n{"name": "fn", "arguments": {...}}\\n```
+      4. Raw JSON: {"name": "fn", "arguments": {...}}
+    """
+    content = message.get("content") or ""
+    if not content or "tool_calls" in message:
+        return message
+
+    tool_calls = []
+
+    # Format 1: <tool_call>{"name": "fn", "arguments": {...}}</tool_call>
+    for m in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", content, re.DOTALL):
+        try:
+            obj = json.loads(m.group(1))
+            name = obj.get("name") or obj.get("function")
+            args = obj.get("arguments") or obj.get("parameters") or {}
+            if name:
+                tool_calls.append({
+                    "id": f"call_{secrets.token_hex(6)}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args) if not isinstance(args, str) else args,
+                    },
+                })
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    # Format 2: <xml><function_name>{...}</function_name></xml>
+    if not tool_calls:
+        xml_body = re.search(r"<xml>(.*?)</xml>", content, re.DOTALL)
+        if xml_body:
+            for m in re.finditer(r"<(\w+)>\s*(\{.*?\})\s*</\1>", xml_body.group(1), re.DOTALL):
+                try:
+                    args = json.loads(m.group(2))
+                    tool_calls.append({
+                        "id": f"call_{secrets.token_hex(6)}",
+                        "type": "function",
+                        "function": {"name": m.group(1), "arguments": json.dumps(args)},
+                    })
+                except json.JSONDecodeError:
+                    pass
+
+    # Format 3 & 4: JSON object with "name"+"arguments" keys (raw or in ```json block)
+    if not tool_calls:
+        candidates = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+        if not candidates:
+            candidates = re.findall(r"(\{[^{}]*\"name\"\s*:[^{}]*\"arguments\"\s*:[^{}]*\})", content, re.DOTALL)
+        for raw in candidates:
+            try:
+                obj = json.loads(raw)
+                name = obj.get("name") or obj.get("function")
+                args = obj.get("arguments") or obj.get("parameters") or {}
+                if name and isinstance(args, (dict, str)):
+                    tool_calls.append({
+                        "id": f"call_{secrets.token_hex(6)}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args) if not isinstance(args, str) else args,
+                        },
+                    })
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    if tool_calls:
+        return {"role": "assistant", "content": None, "tool_calls": tool_calls}
+    return message
+
+
 class ChatRequest(BaseModel):
-    model_config = {"extra": "ignore"}  # ignore unknown OpenAI fields (logprobs, etc.)
     model: Optional[str] = None
     messages: List[Message] = Field(..., min_length=1, max_length=500)
     stream: bool = True
@@ -365,6 +444,8 @@ async def chat_completions(request: Request, body: ChatRequest):
         pool.release(llm)
 
     choice = data["choices"][0]
+    message = _normalise_tool_calls(choice["message"])
+    finish_reason = "tool_calls" if message.get("tool_calls") else choice.get("finish_reason", "stop")
     return {
         "id": f"chatcmpl-{secrets.token_hex(8)}",
         "object": "chat.completion",
@@ -372,8 +453,8 @@ async def chat_completions(request: Request, body: ChatRequest):
         "choices": [
             {
                 "index": 0,
-                "message": choice["message"],
-                "finish_reason": choice.get("finish_reason", "stop"),
+                "message": message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": data.get("usage", {}),
