@@ -56,6 +56,7 @@ ENV_FILE = Path(".env")
 
 _config: dict = {
     "model_path": os.getenv("MODEL_PATH", ""),
+    "model_id": os.getenv("MODEL_ID", ""),  # Override reported model ID (e.g. for GitHub Copilot)
     "api_key": os.getenv("API_KEY", ""),
     "rate_limit": os.getenv("RATE_LIMIT", "30/minute"),
     "n_parallel": int(os.getenv("N_PARALLEL", "4")),
@@ -422,14 +423,15 @@ async def health():
 @app.get("/v1/models", dependencies=[Depends(require_api_key)])
 async def list_models():
     """List loaded model (OpenAI-compatible)."""
+    model_id = _config["model_id"] or Path(_config["model_path"]).stem
     return {
         "object": "list",
         "data": [
             {
-                "id": Path(_config["model_path"]).stem,
+                "id": model_id,
                 "object": "model",
                 "created": int(time.time()),
-                "owned_by": "google",
+                "owned_by": "local",
             }
         ],
     }
