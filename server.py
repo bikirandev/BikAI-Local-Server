@@ -432,6 +432,12 @@ async def list_models():
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "local",
+                "capabilities": {
+                    "type": "chat",
+                    "supports_streaming": True,
+                    "supports_tool_calls": True,
+                },
+                "context_window": _config["n_ctx"],
             }
         ],
     }
