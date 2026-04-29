@@ -519,6 +519,7 @@ server {{
         proxy_cache off;
         proxy_read_timeout {read_timeout}s;
         chunked_transfer_encoding on;
+        add_header X-Accel-Buffering no always;
     }}
 
     # ── Controller API ────────────────────────────────────────
