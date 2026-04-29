@@ -420,9 +420,9 @@ async def health():
 # ---------------------------------------------------------------------------
 
 
-@app.get("/v1/models", dependencies=[Depends(require_api_key)])
+@app.get("/v1/models")
 async def list_models():
-    """List loaded model (OpenAI-compatible)."""
+    """List loaded model (OpenAI-compatible). No auth required — standard for OpenAI-compatible APIs."""
     model_id = _config["model_id"] or Path(_config["model_path"]).stem
     return {
         "object": "list",
