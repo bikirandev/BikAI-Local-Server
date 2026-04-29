@@ -588,6 +588,17 @@ async def _stream_chat(
                 }
                 yield f"data: {json.dumps(sse)}\n\n"
 
+        # Final chunk: empty delta with finish_reason (required by OpenAI spec)
+        last_finish = "stop"
+        if raw_chunks:
+            last_finish = raw_chunks[-1]["choices"][0].get("finish_reason") or "stop"
+        final_chunk = {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": last_finish}],
+        }
+        yield f"data: {json.dumps(final_chunk)}\n\n"
+
     yield "data: [DONE]\n\n"
 
 
