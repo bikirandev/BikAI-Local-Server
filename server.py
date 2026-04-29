@@ -514,10 +514,11 @@ async def _stream_chat(
 
     loop.run_in_executor(_state["executor"], _produce)
 
-    # Buffer all content — needed to detect & normalise tool calls before emitting
     stream_id = f"chatcmpl-{secrets.token_hex(8)}"
+    emitted_header = False
     buffered_content: list[str] = []
     raw_chunks: list[dict] = []
+    has_tool_call = False
 
     while True:
         chunk = await chunk_queue.get()
@@ -526,84 +527,81 @@ async def _stream_chat(
         raw_chunks.append(chunk)
         delta = chunk["choices"][0].get("delta", {})
         content = delta.get("content", "")
-        if content:
-            buffered_content.append(content)
 
-    full_content = "".join(buffered_content)
+        # Check if this chunk contains a raw tool-call marker
+        if content and ("<tool_call>" in content or "<function_calls>" in content):
+            has_tool_call = True
 
-    # Check if the buffered content contains a tool call
-    normalised = _normalise_tool_calls({"role": "assistant", "content": full_content})
-
-    if normalised.get("tool_calls"):
-        # Emit proper streaming tool_calls SSE format
-        tool_calls = normalised["tool_calls"]
-        # First chunk: role + tool call header with id/name
-        first = {
-            "id": stream_id,
-            "object": "chat.completion.chunk",
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "index": 0,
-                        "id": tool_calls[0]["id"],
-                        "type": "function",
-                        "function": {"name": tool_calls[0]["function"]["name"], "arguments": ""},
-                    }],
-                },
-                "finish_reason": None,
-            }],
-        }
-        yield f"data: {json.dumps(first)}\n\n"
-
-        # Arguments chunk
-        args_chunk = {
-            "id": stream_id,
-            "object": "chat.completion.chunk",
-            "choices": [{
-                "index": 0,
-                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": tool_calls[0]["function"]["arguments"]}}]},
-                "finish_reason": None,
-            }],
-        }
-        yield f"data: {json.dumps(args_chunk)}\n\n"
-
-        # Final chunk with finish_reason
-        final = {
-            "id": stream_id,
-            "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-        }
-        yield f"data: {json.dumps(final)}\n\n"
-    else:
-        # Regular content — emit buffered chunks as-is
-        for rc in raw_chunks:
-            delta = rc["choices"][0].get("delta", {})
-            content = delta.get("content", "")
+        if has_tool_call:
+            # Buffer everything — we need full content to normalise tool calls
             if content:
+                buffered_content.append(content)
+        else:
+            # Stream content tokens immediately
+            if content:
+                if not emitted_header:
+                    header = {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(header)}\n\n"
+                    emitted_header = True
                 sse = {
                     "id": stream_id,
                     "object": "chat.completion.chunk",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": content},
-                        "finish_reason": None,
-                    }],
+                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(sse)}\n\n"
 
-        # Final chunk: empty delta with finish_reason (required by OpenAI spec)
-        last_finish = "stop"
-        if raw_chunks:
-            last_finish = raw_chunks[-1]["choices"][0].get("finish_reason") or "stop"
-        final_chunk = {
-            "id": stream_id,
-            "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": last_finish}],
-        }
-        yield f"data: {json.dumps(final_chunk)}\n\n"
+    if has_tool_call:
+        # Normalise and emit tool call chunks
+        full_content = "".join(buffered_content)
+        normalised = _normalise_tool_calls({"role": "assistant", "content": full_content})
+        tool_calls = normalised.get("tool_calls", [])
+        if tool_calls:
+            first = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": tool_calls[0]["id"],
+                            "type": "function",
+                            "function": {"name": tool_calls[0]["function"]["name"], "arguments": ""},
+                        }],
+                    },
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(first)}\n\n"
+            args_chunk = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{"index": 0, "function": {"arguments": tool_calls[0]["function"]["arguments"]}}]},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(args_chunk)}\n\n"
+            yield f"data: {json.dumps({'id': stream_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
+        else:
+            # tool call detection was a false positive — emit as plain content
+            for rc in raw_chunks:
+                c = rc["choices"][0].get("delta", {}).get("content", "")
+                if c:
+                    yield f"data: {json.dumps({'id': stream_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': c}, 'finish_reason': None}]})}\n\n"
+            last_finish = raw_chunks[-1]["choices"][0].get("finish_reason") or "stop" if raw_chunks else "stop"
+            yield f"data: {json.dumps({'id': stream_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': last_finish}]})}\n\n"
+    else:
+        # Emit final stop chunk
+        last_finish = raw_chunks[-1]["choices"][0].get("finish_reason") or "stop" if raw_chunks else "stop"
+        yield f"data: {json.dumps({'id': stream_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': last_finish}]})}\n\n"
 
     yield "data: [DONE]\n\n"
 
